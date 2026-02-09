@@ -26,14 +26,16 @@
       integer :: nalp
       double precision, dimension(45,0:2,-2:2) :: ch
       double precision, dimension(500) :: alpb, xfac
-      double precision, dimension(6,107) :: aij
-      double precision, dimension(52,107) :: repd
-      double precision, dimension(10,2) :: cored
-      double precision, dimension(3,3) :: sp
-      double precision, dimension(5,5) :: sd
-      double precision, dimension(6,3,3) :: pp
-      double precision, dimension(15,5,3) :: dp
-      double precision, dimension(15,5,5) :: d_d
+	      double precision, dimension(6,107) :: aij
+	      double precision, dimension(52,107) :: repd
+	      double precision, dimension(10,2) :: cored
+!$omp threadprivate(cored)
+	      double precision, dimension(3,3) :: sp
+	      double precision, dimension(5,5) :: sd
+	      double precision, dimension(6,3,3) :: pp
+	      double precision, dimension(15,5,3) :: dp
+	      double precision, dimension(15,5,5) :: d_d
+!$omp threadprivate(sp, sd, pp, dp, d_d)
       double precision, dimension(30) :: fx   !   Factorials:  fx(i) = i!
       double precision, dimension(30,30) :: b  !   Binomial expansion (Pascal's triangle): b(1,1) = 1
 

@@ -666,20 +666,23 @@ subroutine fz2 (f, ptot, iorbs, nat, ifact, q, qe, wj, wk, ptot2, mode, kopt, &
     end if
 end subroutine fz2
 !
-subroutine fz2n (f, ptot, iorbs, nat, ifact, q, qe, wj, wk, ptot2, mode, &
-     & kopt, ione, coord)
-    use molkst_C, only: numat, norbs, mpack, numcal, l_feather
-    use MOZYME_C, only : nijbo, &
-       & direct, semidr
-    use parameters_C, only: am, dd, ad, tore
-    use cosmo_C, only: useps
-    use funcon_C, only: ev, a0
-   ! use permanent_arrays, only: iatsp, ipiden, phinet, &
-   !      & qdenet, qscnet, gden, qscat
+	subroutine fz2n (f, ptot, iorbs, nat, ifact, q, qe, wj, wk, ptot2, mode, &
+	     & kopt, ione, coord)
+	    use molkst_C, only: numat, norbs, mpack, numcal, l_feather
+	    use MOZYME_C, only : nijbo, &
+	       & direct, semidr
+	    use parameters_C, only: am, dd, ad, tore
+	    use cosmo_C, only: useps
+	    use funcon_C, only: ev, a0
+#ifdef _OPENMP
+	    use omp_lib, only: omp_get_max_threads, omp_get_num_threads, omp_get_thread_num
+#endif
+	   ! use permanent_arrays, only: iatsp, ipiden, phinet, &
+	   !      & qdenet, qscnet, gden, qscat
 
      use linear_cosmo, only: addfckz
 
-    implicit none
+	    implicit none
    !***********************************************************************
    !
    ! FOCK2 FORMS THE TWO-ELECTRON TWO-CENTER REPULSION PART OF THE FOCK
@@ -700,17 +703,25 @@ subroutine fz2n (f, ptot, iorbs, nat, ifact, q, qe, wj, wk, ptot2, mode, &
     double precision, dimension (numat, 81), intent (inout) :: ptot2
    !
    !.. Local Scalars ..
-    logical :: calci, calcj
-    integer, save :: icalcn = 0, krinc = 0
-    integer :: i, i1, iab, ii, iim1, ij, ilim, ired, j, j1, jba, ji, jj, jk, &
-   & jred, k, kj, kl, kr, l, li, lii, lij, lj, ljj, lk, m, ni, nj
-    double precision :: sum, sumdia, sumoff, ade, aee, da, dx, dy, dz, r, r2, &
-   & ri2, ri5, rm, rp, w1, w2, w3, w4, w5, w6, w7, enuc, rij, point, const
-    integer, dimension (256), save :: jindex
-    double precision, dimension (16) :: pja, pjb
-    double precision, dimension (45) :: e1b, e2a
-    double precision, dimension (171) :: fdummy = 0.d0
-    double precision, dimension (2025) :: wjloc = 0.d0
+	    logical :: calci, calcj
+	    integer, save :: icalcn = 0, krinc = 0
+	    integer :: i, i1, iab, ii, iim1, ij, ilim, ired, j, j1, jba, ji, jj, jk, &
+	   & jred, k, kj, kl, kr, l, li, lii, lij, lj, ljj, lk, m, ni, nj
+	    double precision :: sum, sumdia, sumoff, ade, aee, da, dx, dy, dz, r, r2, &
+	   & ri2, ri5, rm, rp, w1, w2, w3, w4, w5, w6, w7, enuc, rij, point, const
+#ifdef _OPENMP
+	    integer :: max_threads, nthreads_used, tid
+	    logical :: use_parallel_fock
+	    logical, allocatable :: calc_atom(:)
+	    double precision, allocatable, save :: fdiag_thread(:, :, :)
+	    integer, save :: fdiag_thread_numat = 0
+	    integer, save :: fdiag_thread_nthreads = 0
+#endif
+	    integer, dimension (256), save :: jindex
+	    double precision, dimension (16) :: pja, pjb
+	    double precision, dimension (45) :: e1b, e2a
+	    double precision, dimension (171) :: fdummy = 0.d0
+	    double precision, dimension (2025) :: wjloc = 0.d0
    !
     dx = 0.d0
     dy = 0.d0
@@ -761,24 +772,405 @@ subroutine fz2n (f, ptot, iorbs, nat, ifact, q, qe, wj, wk, ptot2, mode, &
       f(1:mpack) = -f(1:mpack)
     end if
     l = 0
-    do ii = 1, numat
-      q(ii) = tore(nat(ii)) - qe(ii)
-      i = nijbo (ii, ii)
-      iab = iorbs(ii)
+	    do ii = 1, numat
+	      q(ii) = tore(nat(ii)) - qe(ii)
+	      i = nijbo (ii, ii)
+	      iab = iorbs(ii)
       m = 0
       do j = 1, iab
         do k = 1, iab
           m = m + 1
           jk = Min (j, k)
           kj = k + j - jk
-          ptot2(ii, m) = ptot(i+ (kj*(kj-1))/2+jk)
-        end do
-      end do
-    end do
-    kr = 0
-    ired = 1
-    do ii = 1, numat
-      calci = (kopt(ired) == ii)
+	          ptot2(ii, m) = ptot(i+ (kj*(kj-1))/2+jk)
+	        end do
+	      end do
+	    end do
+
+#ifdef _OPENMP
+	    use_parallel_fock = .false.
+	    max_threads = omp_get_max_threads()
+	    use_parallel_fock = (direct .and. semidr .and. max_threads > 1)
+	    if (use_parallel_fock) then
+	      allocate (calc_atom(numat))
+	      if (mode == 0) then
+	        calc_atom(:) = .true.
+	      else
+	        calc_atom(:) = .false.
+	        do i = 1, numat
+	          if (kopt(i) > 0 .and. kopt(i) <= numat) calc_atom(kopt(i)) = .true.
+	        end do
+	      end if
+
+	      if ((.not. allocated(fdiag_thread)) .or. fdiag_thread_numat /= numat .or. fdiag_thread_nthreads < max_threads) then
+	        if (allocated(fdiag_thread)) deallocate (fdiag_thread)
+	        allocate (fdiag_thread(45, numat, max_threads))
+	        fdiag_thread_numat = numat
+	        fdiag_thread_nthreads = max_threads
+	      end if
+
+	      nthreads_used = 1
+!$omp parallel default(shared) &
+!$omp& private(tid, ii, jj, iim1, calci, calcj, iab, jba, i, j, ij, ilim, i1, j1, li, lj, lii, ljj, lij, &
+!$omp& l, k, m, ni, nj, dx, dy, dz, r2, r, ri2, ri5, rm, rp, ade, aee, da, w1, w2, w3, w4, w5, w6, &
+!$omp& w7, sum, sumdia, sumoff, enuc, rij, point, const, kr, pja, pjb, e1b, e2a, wjloc)
+	      tid = omp_get_thread_num() + 1
+!$omp single
+	      nthreads_used = omp_get_num_threads()
+!$omp end single
+	      fdiag_thread(:, :, tid) = 0.d0
+
+!$omp do schedule(static, 1)
+	      do ii = 1, numat
+	        iab = iorbs(ii)
+	        if (iab == 0) cycle
+	        calci = calc_atom(ii)
+	        iim1 = ii - ione
+	        do jj = 1, iim1
+	          calcj = calc_atom(jj)
+	          if (.not. (calci .or. calcj)) cycle
+	          jba = iorbs(jj)
+	          if (jba == 0) cycle
+
+	          if (nijbo(ii, jj) >= 0) then
+	            kr = 0
+	            call rotate(nat(ii), nat(jj), coord(1, ii), coord(1, jj), wjloc, kr, e1b, e2a, enuc)
+	            !
+	            if (iab > 5 .or. jba > 5) then
+	              !
+	              !   Use "d"-orbital specific code
+	              !
+	              i = nijbo (ii, ii) + 1
+	              j = nijbo (jj, jj) + 1
+	              ij = nijbo (ii, jj) + 1
+	              kr = 0
+	              call focd2z (iab, jba, fdiag_thread(1:(iab*(iab+1))/2, ii, tid), &
+	             & fdiag_thread(1:(jba*(jba+1))/2, jj, tid), f(ij), ptot(i), &
+	             & ptot(j), ptot(ij), wjloc, wjloc, .false., kr)
+
+	            else if (iab >= 3 .and. jba >= 3) then
+	              !
+	              !                         HEAVY-ATOM  - HEAVY-ATOM
+	              !
+	              do i = 1, 16
+	                pja(i) = ptot2(ii, i)
+	                pjb(i) = ptot2(jj, i)
+	              end do
+	              !
+	              !  COULOMB TERMS (diagonal blocks only)
+	              !
+	              ilim = (iab*(iab+1)) / 2
+	              call jab_for_MOZYME (1, 1, pja, pjb, wjloc, fdiag_thread(1:ilim, ii, tid), &
+	             & fdiag_thread(1:ilim, jj, tid))
+	              !
+	              !  EXCHANGE TERMS (off-diagonal block)
+	              !
+	              l = nijbo (ii, jj) + 1
+	              call kab_for_MOZYME (0, 0, ptot(l), wjloc, f(l))
+
+	            else if (iab >= 3 .and. jba == 1) then
+	              !
+	              !                         LIGHT-ATOM  - HEAVY-ATOM
+	              !
+	              sumdia = 0.d0
+	              sumoff = 0.d0
+	              l = nijbo (ii, jj)
+	              j1 = nijbo (jj, jj)
+	              i1 = nijbo (ii, ii)
+	              lj = j1 + 1
+	              li = i1
+	              k = 0
+	              do i = 1, 4
+	                do j = 1, i - 1
+	                  li = li + 1
+	                  k = k + 1
+	                  fdiag_thread(li-i1, ii, tid) = fdiag_thread(li-i1, ii, tid) + ptot(lj) * wjloc(k)
+	                  sumoff = sumoff + ptot(li) * wjloc(k)
+	                end do
+	                li = li + 1
+	                k = k + 1
+	                fdiag_thread(li-i1, ii, tid) = fdiag_thread(li-i1, ii, tid) + ptot(lj) * wjloc(k)
+	                sumdia = sumdia + ptot(li) * wjloc(k)
+	              end do
+	              fdiag_thread(lj-j1, jj, tid) = fdiag_thread(lj-j1, jj, tid) + sumoff * 2.d0 + sumdia
+	              !
+	              !  EXCHANGE TERMS (off-diagonal block)
+	              !
+	              k = 0
+	              do i = 1, 4
+	                sum = 0.d0
+	                do j = 1, 4
+	                  k = k + 1
+	                  sum = sum + ptot(l+j) * wjloc(jindex(k))
+	                end do
+	                f(l+i) = f(l+i) - sum * 0.5d0
+	              end do
+
+	            else if (jba >= 3 .and. iab == 1) then
+	              !
+	              !                         HEAVY-ATOM - LIGHT-ATOM
+	              !
+	              sumdia = 0.d0
+	              sumoff = 0.d0
+	              l = nijbo (ii, jj)
+	              j1 = nijbo (jj, jj)
+	              i1 = nijbo (ii, ii)
+	              lj = j1
+	              li = i1 + 1
+	              k = 0
+	              do i = 1, 4
+	                do j = 1, i - 1
+	                  k = k + 1
+	                  lj = lj + 1
+	                  fdiag_thread(lj-j1, jj, tid) = fdiag_thread(lj-j1, jj, tid) + ptot(li) * wjloc(k)
+	                  sumoff = sumoff + ptot(lj) * wjloc(k)
+	                end do
+	                lj = lj + 1
+	                k = k + 1
+	                fdiag_thread(lj-j1, jj, tid) = fdiag_thread(lj-j1, jj, tid) + ptot(li) * wjloc(k)
+	                sumdia = sumdia + ptot(lj) * wjloc(k)
+	              end do
+	              fdiag_thread(li-i1, ii, tid) = fdiag_thread(li-i1, ii, tid) + sumoff * 2.d0 + sumdia
+	              !
+	              !  EXCHANGE TERMS (off-diagonal block)
+	              !
+	              k = 0
+	              do i = 1, 4
+	                sum = 0.d0
+	                do j = 1, 4
+	                  k = k + 1
+	                  sum = sum + ptot(l+j) * wjloc(jindex(k))
+	                end do
+	                f(l+i) = f(l+i) - sum * 0.5d0
+	              end do
+
+	            else if (iab == 1 .and. jba == 1) then
+	              !
+	              !                         LIGHT-ATOM - LIGHT-ATOM
+	              !
+	              i1 = nijbo (ii, ii)
+	              j1 = nijbo (jj, jj)
+	              lii = i1 + 1
+	              lij = nijbo (ii, jj) + 1
+	              ljj = j1 + 1
+	              fdiag_thread(lii-i1, ii, tid) = fdiag_thread(lii-i1, ii, tid) + ptot(ljj) * wjloc(1)
+	              fdiag_thread(ljj-j1, jj, tid) = fdiag_thread(ljj-j1, jj, tid) + ptot(lii) * wjloc(1)
+	              f(lij) = f(lij) - ptot(lij) * wjloc(1) * 0.5d0
+	            end if
+
+	          else
+	            !
+	            !   Use point-charge approximation
+	            !
+	            i1 = nijbo (ii, ii)
+	            j1 = nijbo (jj, jj)
+
+	            if (iorbs(ii)*iorbs(jj) > 0) then
+
+	              if (calci .or. calcj) then
+	                if (semidr) then
+	                  dx = coord(1, ii) - coord(1, jj)
+	                  dy = coord(2, ii) - coord(2, jj)
+	                  dz = coord(3, ii) - coord(3, jj)
+	                  r2 = dx * dx + dy * dy + dz * dz
+	                  ni = nat(ii)
+	                  nj = nat(jj)
+	                  aee = 0.5d0 / am(ni) + 0.5d0 / am(nj)
+	                  if (l_feather) then
+	                    rij = sqrt(r2)
+	                    call to_point(rij, point, const)
+	                    w1 = ev / Sqrt (r2/(a0**2)+aee**2)
+	                    w1 = w1*const + (1.d0 - const)*point
+	                  else
+	                    w1 = ev / Sqrt (r2/(a0**2)+aee**2)
+	                  end if
+	                else
+	                  w1 = wj(kr+1)
+	                end if
+	                !
+	                !   MONOPOLE
+	                !
+	                lii = i1
+	                ljj = j1
+	                do i = 1, iorbs(ii)
+	                  i1 = i1 + i
+	                  fdiag_thread(i1-lii, ii, tid) = fdiag_thread(i1-lii, ii, tid) + qe(jj) * w1
+	                end do
+	                do j = 1, iorbs(jj)
+	                  j1 = j1 + j
+	                  fdiag_thread(j1-ljj, jj, tid) = fdiag_thread(j1-ljj, jj, tid) + qe(ii) * w1
+	                end do
+	                i1 = lii
+	                j1 = ljj
+	              end if
+
+	              if ( .not. semidr) then
+	                kr = kr + 1
+	              end if
+	              !
+	              if (nijbo(ii, jj) == -2) then
+	                !
+	                !   DIPOLE, IF NEEDED
+	                !
+	                if ((calci .or. calcj) .and. semidr) then
+	                  r = Sqrt (r2)
+	                  dx = dx / r
+	                  dy = dy / r
+	                  dz = dz / r
+	                  if (Abs (dz) > 0.99999999d0) then
+	                    dz = Sign (1.d0, dz)
+	                  end if
+
+	                  if (iorbs(ii) > 1) then
+	                    da = dd(ni)
+	                    ade = 0.5d0 / ad(ni) + 0.5d0 / am(nj)
+	                    rp = Sqrt ((r/a0+da)**2+ade**2)
+	                    rm = Sqrt ((r/a0-da)**2+ade**2)
+	                    ri2 = ev * (0.5d0/rp-0.5d0/rm)
+	                    if (l_feather) then
+	                      call to_point(r, point, const)
+	                      ri2 = ri2*const
+	                    end if
+	                    w5 = ri2 * dx
+	                    w6 = ri2 * dy
+	                    w7 = ri2 * dz
+	                  end if
+
+	                  if (iorbs(jj) > 1) then
+	                    da = dd(nj)
+	                    ade = 0.5d0 / am(ni) + 0.5d0 / ad(nj)
+	                    rp = Sqrt ((r/a0+da)**2+ade**2)
+	                    rm = Sqrt ((r/a0-da)**2+ade**2)
+	                    ri5 = -ev * (0.5d0/rp-0.5d0/rm)
+	                    if (l_feather) then
+	                      call to_point(r, point, const)
+	                      ri5 = ri5*const
+	                    end if
+	                    w2 = ri5 * dx
+	                    w3 = ri5 * dy
+	                    w4 = ri5 * dz
+	                  end if
+	                end if
+
+	                if (iorbs(ii) > 1) then
+	                  if (iorbs(jj) > 1) then
+	                    if (calci .or. calcj) then
+	                      if ( .not. semidr) then
+	                        w2 = wj(kr+1)
+	                        w3 = wj(kr+2)
+	                        w4 = wj(kr+3)
+	                        w5 = wj(kr+4)
+	                        w6 = wj(kr+5)
+	                        w7 = wj(kr+6)
+	                      end if
+	                      fdiag_thread(2, jj, tid) = fdiag_thread(2, jj, tid) + qe(ii) * w2
+	                      fdiag_thread(4, jj, tid) = fdiag_thread(4, jj, tid) + qe(ii) * w3
+	                      fdiag_thread(7, jj, tid) = fdiag_thread(7, jj, tid) + qe(ii) * w4
+	                      fdiag_thread(2, ii, tid) = fdiag_thread(2, ii, tid) + qe(jj) * w5
+	                      fdiag_thread(4, ii, tid) = fdiag_thread(4, ii, tid) + qe(jj) * w6
+	                      fdiag_thread(7, ii, tid) = fdiag_thread(7, ii, tid) + qe(jj) * w7
+
+	                      fdiag_thread(1, jj, tid) = fdiag_thread(1, jj, tid) + ptot(i1+2) * w5 * 2
+	                      fdiag_thread(3, jj, tid) = fdiag_thread(3, jj, tid) + ptot(i1+2) * w5 * 2
+	                      fdiag_thread(6, jj, tid) = fdiag_thread(6, jj, tid) + ptot(i1+2) * w5 * 2
+	                      fdiag_thread(10, jj, tid) = fdiag_thread(10, jj, tid) + ptot(i1+2) * w5 * 2
+
+	                      fdiag_thread(1, jj, tid) = fdiag_thread(1, jj, tid) + ptot(i1+4) * w6 * 2
+	                      fdiag_thread(3, jj, tid) = fdiag_thread(3, jj, tid) + ptot(i1+4) * w6 * 2
+	                      fdiag_thread(6, jj, tid) = fdiag_thread(6, jj, tid) + ptot(i1+4) * w6 * 2
+	                      fdiag_thread(10, jj, tid) = fdiag_thread(10, jj, tid) + ptot(i1+4) * w6 * 2
+
+	                      fdiag_thread(1, jj, tid) = fdiag_thread(1, jj, tid) + ptot(i1+7) * w7 * 2
+	                      fdiag_thread(3, jj, tid) = fdiag_thread(3, jj, tid) + ptot(i1+7) * w7 * 2
+	                      fdiag_thread(6, jj, tid) = fdiag_thread(6, jj, tid) + ptot(i1+7) * w7 * 2
+	                      fdiag_thread(10, jj, tid) = fdiag_thread(10, jj, tid) + ptot(i1+7) * w7 * 2
+
+	                      fdiag_thread(1, ii, tid) = fdiag_thread(1, ii, tid) + ptot(j1+2) * w2 * 2
+	                      fdiag_thread(3, ii, tid) = fdiag_thread(3, ii, tid) + ptot(j1+2) * w2 * 2
+	                      fdiag_thread(6, ii, tid) = fdiag_thread(6, ii, tid) + ptot(j1+2) * w2 * 2
+	                      fdiag_thread(10, ii, tid) = fdiag_thread(10, ii, tid) + ptot(j1+2) * w2 * 2
+
+	                      fdiag_thread(1, ii, tid) = fdiag_thread(1, ii, tid) + ptot(j1+4) * w3 * 2
+	                      fdiag_thread(3, ii, tid) = fdiag_thread(3, ii, tid) + ptot(j1+4) * w3 * 2
+	                      fdiag_thread(6, ii, tid) = fdiag_thread(6, ii, tid) + ptot(j1+4) * w3 * 2
+	                      fdiag_thread(10, ii, tid) = fdiag_thread(10, ii, tid) + ptot(j1+4) * w3 * 2
+
+	                      fdiag_thread(1, ii, tid) = fdiag_thread(1, ii, tid) + ptot(j1+7) * w4 * 2
+	                      fdiag_thread(3, ii, tid) = fdiag_thread(3, ii, tid) + ptot(j1+7) * w4 * 2
+	                      fdiag_thread(6, ii, tid) = fdiag_thread(6, ii, tid) + ptot(j1+7) * w4 * 2
+	                      fdiag_thread(10, ii, tid) = fdiag_thread(10, ii, tid) + ptot(j1+7) * w4 * 2
+	                    end if
+
+	                    if ( .not. semidr) then
+	                      kr = kr + 6
+	                    end if
+	                  else
+	                    if (calci .or. calcj) then
+	                      if ( .not. semidr) then
+	                        w5 = wj(kr+1)
+	                        w6 = wj(kr+2)
+	                        w7 = wj(kr+3)
+	                      end if
+	                      fdiag_thread(2, ii, tid) = fdiag_thread(2, ii, tid) + qe(jj) * w5
+	                      fdiag_thread(4, ii, tid) = fdiag_thread(4, ii, tid) + qe(jj) * w6
+	                      fdiag_thread(7, ii, tid) = fdiag_thread(7, ii, tid) + qe(jj) * w7
+
+	                      fdiag_thread(1, jj, tid) = fdiag_thread(1, jj, tid) + ptot(i1+2) * w5 * 2
+	                      fdiag_thread(1, jj, tid) = fdiag_thread(1, jj, tid) + ptot(i1+4) * w6 * 2
+	                      fdiag_thread(1, jj, tid) = fdiag_thread(1, jj, tid) + ptot(i1+7) * w7 * 2
+	                    end if
+	                    if ( .not. semidr) then
+	                      kr = kr + 3
+	                    end if
+	                  end if
+	                else if (iorbs(jj) > 1) then
+	                  if (calci .or. calcj) then
+	                    if ( .not. semidr) then
+	                      w2 = wj(kr+1)
+	                      w3 = wj(kr+2)
+	                      w4 = wj(kr+3)
+	                    end if
+	                    fdiag_thread(2, jj, tid) = fdiag_thread(2, jj, tid) + qe(ii) * w2
+	                    fdiag_thread(4, jj, tid) = fdiag_thread(4, jj, tid) + qe(ii) * w3
+	                    fdiag_thread(7, jj, tid) = fdiag_thread(7, jj, tid) + qe(ii) * w4
+
+	                    fdiag_thread(1, ii, tid) = fdiag_thread(1, ii, tid) + ptot(j1+2) * w2 * 2
+	                    fdiag_thread(1, ii, tid) = fdiag_thread(1, ii, tid) + ptot(j1+4) * w3 * 2
+	                    fdiag_thread(1, ii, tid) = fdiag_thread(1, ii, tid) + ptot(j1+7) * w4 * 2
+	                  end if
+	                  if ( .not. semidr) then
+	                    kr = kr + 3
+	                  end if
+	                end if
+	              end if
+	            end if
+	          end if
+	        end do
+	      end do
+!$omp end do
+!$omp end parallel
+
+	      do tid = 1, nthreads_used
+	        do ii = 1, numat
+	          iab = iorbs(ii)
+	          if (iab == 0) cycle
+	          ilim = (iab*(iab+1)) / 2
+	          i = nijbo (ii, ii)
+	          do j = 1, ilim
+	            f(i+j) = f(i+j) + fdiag_thread(j, ii, tid)
+	          end do
+	        end do
+	      end do
+
+	      deallocate (calc_atom)
+	      go to 900
+	    end if
+#endif
+
+	    kr = 0
+	    ired = 1
+	    do ii = 1, numat
+	      calci = (kopt(ired) == ii)
       if (calci .and. ired < numat) then
         ired = ired + 1
       end if
@@ -1273,12 +1665,13 @@ subroutine fz2n (f, ptot, iorbs, nat, ifact, q, qe, wj, wk, ptot2, mode, &
             call fock1_for_MOZYME (f(i), ptot(i), wj(kr+1), kr, iab, ilim)
           end if
         end if
-    end do
-    if (direct) then
-      kr = 0
-      ired = 1
-      do ii = 1, numat
-          iab = iorbs(ii)
+	    end do
+900 continue
+	    if (direct) then
+	      kr = 0
+	      ired = 1
+	      do ii = 1, numat
+	          iab = iorbs(ii)
           if (iab /= 0) then
             i = nijbo (ii, ii) + 1
             ilim = (iab*(iab+1)) / 2

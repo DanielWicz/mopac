@@ -31,6 +31,9 @@
     use common_arrays_C, only : eigs, nat
     use parameters_C, only: main_group
     use chanel_C, only: iw
+#ifdef _OPENMP
+    use omp_lib, only: omp_get_max_threads
+#endif
     implicit none
     integer, intent (in) :: idiagg, nij, nocc, nvir
     logical, dimension (numat), intent (out) :: latoms
@@ -39,6 +42,7 @@
     double precision, dimension (nvirtual), intent (in) :: eigv
     logical :: bug = .false.
     logical :: retry
+    logical :: use_parallel_diagg2
     logical, save :: debug, times
     integer :: i, ii, jur, l
     integer, save :: icalcn = 0
@@ -49,6 +53,18 @@
     double precision, external :: reada
     integer, dimension (2) :: nrejct
     data nrejct / 2 * 0 /
+#ifdef _OPENMP
+    integer :: alloc_stat, max_threads
+    integer :: lvl, max_level, nactive, pos
+    integer, allocatable :: edge_level(:), last_occ(:), last_vir(:)
+    integer, allocatable :: level_count(:), level_offset(:), level_pos(:), level_edges(:)
+    integer, allocatable :: iused_t(:)
+    logical, allocatable :: latoms_t(:)
+    double precision, allocatable :: storei_t(:), storej_t(:)
+    logical :: active
+    double precision :: sumb_local
+    integer :: nrej_local
+#endif
     if (numcal /= icalcn) then
       icalcn = numcal
       times = (Index (keywrd, " TIMES") /= 0)
@@ -150,210 +166,553 @@
     sumb = 0.d0
     nrej = 0
     lij = 0
-    outer_loop: do ij = 1, nij
-      i = ifmo(1, ij)
-      j = ifmo(2, ij)
-      if (Abs (fmo(ij)) >= tiny) then
-        c = fmo(ij) * const
-        d = eigs(j) - eigv(i) - shift
-        if (Abs (c/d) >= biglim) then
-          ncfj = ncf(j)
-          ncei = nce(i)
-      !
-      !  STORE LMOS FOR POSSIBLE REJECTION, IF LMOS EXPAND TOO MUCH.
-      !
-          jlr = ncocc(j) + 1
-          if (j /= nocc) then
-            jur = ncocc(j+1)
-            jncf = nncf(j+1)
-          else
-            jur = cocc_dim
-            jncf = icocc_dim
-          end if
-          jur = Min (jlr+norbs-1, jur)
-          ilr = ncvir(i) + 1
-          if (i /= nvir) then
-            iur = ncvir(i+1)
-            incv = nnce(i+1)
-          else
-            iur = cvir_dim
-            incv = icvir_dim
-          end if
-          iur = Min (ilr+norbs-1, iur)
-          l = 0
-          do k = jlr, jur
-            l = l + 1
-            storej(l) = cocc(k)
-          end do
-          l = 0
-          do k = ilr, iur
-            l = l + 1
-            storei(l) = cvir(k)
-          end do
-          !
-          !   STORAGE DONE.
-          !
-          lij = lij + 1
-          e = Sign (Sqrt(4.d0*c*c+d*d), d)
-          alpha = Sqrt (0.5d0*(1.d0+d/e))
-          do
-            beta = -Sign (Sqrt(1.d0-alpha*alpha), c)
-            sumb = sumb + Abs (beta)
-            !
-            ! IDENTIFY THE ATOMS IN THE OCCUPIED LMO.  ATOMS NOT USED ARE
-            ! FLAGGED BY '-1' IN IUSED.
-            !
-            mlf = 0
-            !
-            do lf = nncf(j) + 1, nncf(j) + ncf(j)
-              ii = icocc(lf)
-              iused(ii) = mlf
-              mlf = mlf + iorbs(ii)
-            end do
-            loopi = ncvir(i)
-            loopj = ncocc(j)
-            mle = 0
-         !
-         !      ROTATION OF PSEUDO-EIGENVECTORS
-         !
-            do le = nnce(i) + 1, nnce(i) + nce(i)
-              mie = icvir(le)
+    use_parallel_diagg2 = .false.
+#ifdef _OPENMP
+    max_threads = omp_get_max_threads()
+    use_parallel_diagg2 = (max_threads > 1 .and. nij > 64)
+    if (use_parallel_diagg2) then
+      allocate (edge_level(nij), last_occ(nocc), last_vir(nvir), stat=alloc_stat)
+      if (alloc_stat /= 0) then
+        call mopend("Insufficient memory to run DIAGG2 (parallel scheduling)")
+        use_parallel_diagg2 = .false.
+      else
+        edge_level(:) = 0
+        last_occ(:) = 0
+        last_vir(:) = 0
+        max_level = 0
+        nactive = 0
 
-              latoms(mie) = .true.
-              mlff = iused(mie) + loopj
-              if (iused(mie) >= 0) then
-                !
-                !  TWO BY TWO ROTATION OF ATOMS WHICH ARE COMMON
-                !  TO OCCUPIED LMO J AND VIRTUAL LMO I
-                !
-                do mlee = mle + 1 + loopi, mle + iorbs(mie) + loopi
-                  mlff = mlff + 1
-                  a = cocc(mlff)
-                  b = cvir(mlee)
-                  cocc(mlff) = alpha * a + beta * b
-                  cvir(mlee) = alpha * b - beta * a
-                end do
-              else
-                !
-                !   FILLED  LMO ATOM 'MIE' DOES NOT EXIST.
-                !   CHECK IF IT SHOULD EXIST
-                !
-                sum = 0.d0
-                do mlee = mle + 1 + loopi, mle + iorbs(mie) + loopi
-                  sum = sum + (beta*cvir(mlee)) ** 2
-                end do
-                if (sum > thresh) then
-                  !
-                  if (nncf(j)+ncf(j) >= jncf) go to 1000
-                  if (mlf+iorbs(mie)+loopj > jur) go to 1000
-                  !
-                  !  YES, OCCUPIED LMO ATOM 'MIE' SHOULD EXIST
-                  !
-                  ncf(j) = ncf(j) + 1
-                  icocc(nncf(j)+ncf(j)) = mie
-                  !
-                  iused(mie) = mlf
-                  mlf = mlf + iorbs(mie)
-                  !
-                  !   PUT INTENSITY INTO OCCUPIED LMO ATOM 'MIE'
-                  !
-                  mlff = iused(mie) + loopj
-                  do mlee = mle + 1 + loopi, mle + iorbs(mie) + loopi
-                    mlff = mlff + 1
-                    cocc(mlff) = beta * cvir(mlee)
-                    cvir(mlee) = alpha * cvir(mlee)
-                  end do
-                end if
-              end if
-              mle = mle + iorbs(mie)
-            end do
-            !
-            !  NOW CHECK ALL ATOMS WHICH WERE IN THE OCCUPIED LMO
-            !  WHICH ARE NOT IN THE VIRTUAL LMO, TO SEE IF THEY
-            !  SHOULD BE IN THE VIRTUAL LMO.
-            !
-            do lf = nncf(j) + 1, nncf(j) + ncf(j)
-              ii = icocc(lf)
+        do ij = 1, nij
+          i = ifmo(1, ij)
+          j = ifmo(2, ij)
 
-              if ( .not. latoms(ii)) then
-                sum = 0.d0
-                do mlff = iused(ii) + loopj + 1, iused(ii) + loopj + &
-                     & iorbs(ii)
-                  sum = sum + (beta*cocc(mlff)) ** 2
-                end do
-                if (sum > thresh) then
-                  if (nnce(i)+nce(i) >= incv) go to 1000
-                  if (mle+iorbs(ii)+loopi > iur) go to 1000
-                  !
-                  !  YES, VIRTUAL  LMO ATOM 'II' SHOULD EXIST
-                  !
-                  nce(i) = nce(i) + 1
-                  icvir(nnce(i)+nce(i)) = ii
-                  latoms(ii) = .true.
-                  !
-                  !   PUT INTENSITY INTO VIRTUAL  LMO ATOM 'II'
-                  !
-                  mlff = iused(ii) + loopj
-                  do mlee = mle + 1 + loopi, mle + iorbs(ii) + loopi
-                    mlff = mlff + 1
-                     !
-                    cvir(mlee) = -beta * cocc(mlff)
-                    cocc(mlff) = alpha * cocc(mlff)
-                  end do
-                  mle = mle + iorbs(ii)
-                end if
+          active = .true.
+          if (tiny >= 0.d0) then
+            if (Abs (fmo(ij)) < tiny) active = .false.
+          end if
+
+          if (active .and. biglim >= 0.d0) then
+            c = fmo(ij) * const
+            d = eigs(j) - eigv(i) - shift
+            if (d == 0.d0) then
+              active = (Abs(c) > 0.d0)
+            else
+              active = (Abs (c/d) >= biglim)
+            end if
+          end if
+
+          if (active) then
+            lvl = Max (last_occ(j), last_vir(i)) + 1
+            edge_level(ij) = lvl
+            last_occ(j) = lvl
+            last_vir(i) = lvl
+            if (lvl > max_level) max_level = lvl
+            nactive = nactive + 1
+          end if
+        end do
+
+        if (nactive > 0) then
+          allocate (level_count(max_level), level_offset(max_level+1), level_pos(max_level), &
+               & level_edges(nactive), stat=alloc_stat)
+          if (alloc_stat /= 0) then
+            call mopend("Insufficient memory to run DIAGG2 (parallel scheduling)")
+            use_parallel_diagg2 = .false.
+          else
+            level_count(:) = 0
+            do ij = 1, nij
+              lvl = edge_level(ij)
+              if (lvl > 0) level_count(lvl) = level_count(lvl) + 1
+            end do
+
+            level_offset(1) = 1
+            do lvl = 1, max_level
+              level_offset(lvl+1) = level_offset(lvl) + level_count(lvl)
+            end do
+
+            level_pos(:) = level_offset(1:max_level)
+            do ij = 1, nij
+              lvl = edge_level(ij)
+              if (lvl > 0) then
+                pos = level_pos(lvl)
+                level_edges(pos) = ij
+                level_pos(lvl) = pos + 1
               end if
             end do
-          exit
-      1000  continue
-            nrej = nrej + 1
-              !
-              !   THE ARRAY BOUNDS WERE GOING TO BE EXCEEDED.
-              !   TO PREVENT THIS, RESET THE LMOS.
-              !
+
+            sumb_local = 0.d0
+            nrej_local = 0
+!$omp parallel default(shared) &
+!$omp& private(ij, lvl, pos, alloc_stat, iused_t, latoms_t, storei_t, storej_t) &
+!$omp& reduction(+:sumb_local, nrej_local)
+            allocate (iused_t(numat), latoms_t(numat), storei_t(norbs), storej_t(norbs), stat=alloc_stat)
+            if (alloc_stat /= 0) then
+!$omp critical(diagg2_alloc_fail)
+              call mopend("Insufficient memory to run DIAGG2 (parallel scratch)")
+!$omp end critical(diagg2_alloc_fail)
+            else
+              iused_t(:) = -1
+              latoms_t(:) = .false.
+
+              do lvl = 1, max_level
+!$omp do schedule(static)
+                do pos = level_offset(lvl), level_offset(lvl+1) - 1
+                  ij = level_edges(pos)
+                  call process_pair (ij, retry, tiny, biglim, sumb_local, nrej_local, &
+                       & iused_t, latoms_t, storei_t, storej_t)
+                end do
+!$omp end do
+!$omp barrier
+              end do
+
+              deallocate (iused_t, latoms_t, storei_t, storej_t)
+            end if
+!$omp end parallel
+
+            sumb = sumb_local
+            nrej = nrej_local
+
+            deallocate (level_edges, level_pos, level_offset, level_count)
+          end if
+        end if
+
+        deallocate (edge_level, last_occ, last_vir)
+      end if
+    end if
+#endif
+
+    if (.not. use_parallel_diagg2) then
+      outer_loop: do ij = 1, nij
+        i = ifmo(1, ij)
+        j = ifmo(2, ij)
+        if (Abs (fmo(ij)) >= tiny) then
+          c = fmo(ij) * const
+          d = eigs(j) - eigv(i) - shift
+          if (Abs (c/d) >= biglim) then
+            ncfj = ncf(j)
+            ncei = nce(i)
+        !
+        !  STORE LMOS FOR POSSIBLE REJECTION, IF LMOS EXPAND TOO MUCH.
+        !
+            jlr = ncocc(j) + 1
+            if (j /= nocc) then
+              jur = ncocc(j+1)
+              jncf = nncf(j+1)
+            else
+              jur = cocc_dim
+              jncf = icocc_dim
+            end if
+            jur = Min (jlr+norbs-1, jur)
+            ilr = ncvir(i) + 1
+            if (i /= nvir) then
+              iur = ncvir(i+1)
+              incv = nnce(i+1)
+            else
+              iur = cvir_dim
+              incv = icvir_dim
+            end if
+            iur = Min (ilr+norbs-1, iur)
             l = 0
             do k = jlr, jur
               l = l + 1
-              cocc(k) = storej(l)
+              storej(l) = cocc(k)
             end do
             l = 0
             do k = ilr, iur
               l = l + 1
-              cvir(k) = storei(l)
+              storei(l) = cvir(k)
             end do
-            ncf(j) = ncfj
-            nce(i) = ncei
-            do k = 1, numat
-              iused(k) = -1
-              latoms(k) = .false.
+            !
+            !   STORAGE DONE.
+            !
+            lij = lij + 1
+            e = Sign (Sqrt(4.d0*c*c+d*d), d)
+            alpha = Sqrt (0.5d0*(1.d0+d/e))
+            do
+              beta = -Sign (Sqrt(1.d0-alpha*alpha), c)
+              sumb = sumb + Abs (beta)
+              !
+              ! IDENTIFY THE ATOMS IN THE OCCUPIED LMO.  ATOMS NOT USED ARE
+              ! FLAGGED BY '-1' IN IUSED.
+              !
+              mlf = 0
+              !
+              do lf = nncf(j) + 1, nncf(j) + ncf(j)
+                ii = icocc(lf)
+                iused(ii) = mlf
+                mlf = mlf + iorbs(ii)
+              end do
+              loopi = ncvir(i)
+              loopj = ncocc(j)
+              mle = 0
+           !
+           !      ROTATION OF PSEUDO-EIGENVECTORS
+           !
+              do le = nnce(i) + 1, nnce(i) + nce(i)
+                mie = icvir(le)
+
+                latoms(mie) = .true.
+                mlff = iused(mie) + loopj
+                if (iused(mie) >= 0) then
+                  !
+                  !  TWO BY TWO ROTATION OF ATOMS WHICH ARE COMMON
+                  !  TO OCCUPIED LMO J AND VIRTUAL LMO I
+                  !
+                  do mlee = mle + 1 + loopi, mle + iorbs(mie) + loopi
+                    mlff = mlff + 1
+                    a = cocc(mlff)
+                    b = cvir(mlee)
+                    cocc(mlff) = alpha * a + beta * b
+                    cvir(mlee) = alpha * b - beta * a
+                  end do
+                else
+                  !
+                  !   FILLED  LMO ATOM 'MIE' DOES NOT EXIST.
+                  !   CHECK IF IT SHOULD EXIST
+                  !
+                  sum = 0.d0
+                  do mlee = mle + 1 + loopi, mle + iorbs(mie) + loopi
+                    sum = sum + (beta*cvir(mlee)) ** 2
+                  end do
+                  if (sum > thresh) then
+                    !
+                    if (nncf(j)+ncf(j) >= jncf) go to 1000
+                    if (mlf+iorbs(mie)+loopj > jur) go to 1000
+                    !
+                    !  YES, OCCUPIED LMO ATOM 'MIE' SHOULD EXIST
+                    !
+                    ncf(j) = ncf(j) + 1
+                    icocc(nncf(j)+ncf(j)) = mie
+                    !
+                    iused(mie) = mlf
+                    mlf = mlf + iorbs(mie)
+                    !
+                    !   PUT INTENSITY INTO OCCUPIED LMO ATOM 'MIE'
+                    !
+                    mlff = iused(mie) + loopj
+                    do mlee = mle + 1 + loopi, mle + iorbs(mie) + loopi
+                      mlff = mlff + 1
+                      cocc(mlff) = beta * cvir(mlee)
+                      cvir(mlee) = alpha * cvir(mlee)
+                    end do
+                  end if
+                end if
+                mle = mle + iorbs(mie)
+              end do
+              !
+              !  NOW CHECK ALL ATOMS WHICH WERE IN THE OCCUPIED LMO
+              !  WHICH ARE NOT IN THE VIRTUAL LMO, TO SEE IF THEY
+              !  SHOULD BE IN THE VIRTUAL LMO.
+              !
+              do lf = nncf(j) + 1, nncf(j) + ncf(j)
+                ii = icocc(lf)
+
+                if ( .not. latoms(ii)) then
+                  sum = 0.d0
+                  do mlff = iused(ii) + loopj + 1, iused(ii) + loopj + &
+                       & iorbs(ii)
+                    sum = sum + (beta*cocc(mlff)) ** 2
+                  end do
+                  if (sum > thresh) then
+                    if (nnce(i)+nce(i) >= incv) go to 1000
+                    if (mle+iorbs(ii)+loopi > iur) go to 1000
+                    !
+                    !  YES, VIRTUAL  LMO ATOM 'II' SHOULD EXIST
+                    !
+                    nce(i) = nce(i) + 1
+                    icvir(nnce(i)+nce(i)) = ii
+                    latoms(ii) = .true.
+                    !
+                    !   PUT INTENSITY INTO VIRTUAL  LMO ATOM 'II'
+                    !
+                    mlff = iused(ii) + loopj
+                    do mlee = mle + 1 + loopi, mle + iorbs(ii) + loopi
+                      mlff = mlff + 1
+                       !
+                      cvir(mlee) = -beta * cocc(mlff)
+                      cocc(mlff) = alpha * cocc(mlff)
+                    end do
+                    mle = mle + iorbs(ii)
+                  end if
+                end if
+              end do
+            exit
+        1000  continue
+              nrej = nrej + 1
+                !
+                !   THE ARRAY BOUNDS WERE GOING TO BE EXCEEDED.
+                !   TO PREVENT THIS, RESET THE LMOS.
+                !
+              l = 0
+              do k = jlr, jur
+                l = l + 1
+                cocc(k) = storej(l)
+              end do
+              l = 0
+              do k = ilr, iur
+                l = l + 1
+                cvir(k) = storei(l)
+              end do
+              ncf(j) = ncfj
+              nce(i) = ncei
+              do k = 1, numat
+                iused(k) = -1
+                latoms(k) = .false.
+              end do
+              if (retry) then
+                  !
+                  !   HALF THE ROTATION ANGLE.  WILL THIS PREVENT THE
+                  !   ARRAY BOUND FROM BEING EXCEEDED?
+                  !
+                alpha = 0.5d0 * (alpha+1.d0)
+              else
+                cycle outer_loop
+              end if
             end do
-            if (retry) then
-                !
-                !   HALF THE ROTATION ANGLE.  WILL THIS PREVENT THE
-                !   ARRAY BOUND FROM BEING EXCEEDED?
-                !
-              alpha = 0.5d0 * (alpha+1.d0)
-            else
-              cycle outer_loop
-            end if
-          end do
-        !
-        !  RESET COUNTERS WHICH HAVE BEEN SET.
-        !
-          do le = nnce(i) + 1, nnce(i) + nce(i)
-            mie = icvir(le)
-            latoms(mie) = .false.
-          end do
-        !
-          do lf = nncf(j) + 1, nncf(j) + ncf(j)
-            iused(icocc(lf)) = -1
-          end do
+          !
+          !  RESET COUNTERS WHICH HAVE BEEN SET.
+          !
+            do le = nnce(i) + 1, nnce(i) + nce(i)
+              mie = icvir(le)
+              latoms(mie) = .false.
+            end do
+          !
+            do lf = nncf(j) + 1, nncf(j) + ncf(j)
+              iused(icocc(lf)) = -1
+            end do
+          end if
         end if
-      end if
-    end do outer_loop
+      end do outer_loop
+    end if
     nrejct(2) = nrejct(1)
     nrejct(1) = nrej
     if (times) then
       call timer (" AFTER DIAGG2 IN ITER")
     end if
+  contains
+  subroutine process_pair (ij, retry, tiny, biglim, sumb_acc, nrej_acc, iused_t, latoms_t, storei_t, storej_t)
+    integer, intent (in) :: ij
+    logical, intent (in) :: retry
+    double precision, intent (in) :: tiny, biglim
+    double precision, intent (inout) :: sumb_acc
+    integer, intent (inout) :: nrej_acc
+    integer, dimension (numat), intent (inout) :: iused_t
+    logical, dimension (numat), intent (inout) :: latoms_t
+    double precision, dimension (norbs), intent (inout) :: storei_t, storej_t
+
+    integer :: i, j, ii, jur, l, ilr, incv, iur, jlr, jncf, k, le, lf, loopi, loopj
+    integer :: mie, mle, mlee, mlf, mlff, ncei, ncfj
+    double precision :: a, alpha, b, beta, c, d, e, sum
+
+    i = ifmo(1, ij)
+    j = ifmo(2, ij)
+    if (Abs (fmo(ij)) < tiny) return
+
+    c = fmo(ij) * const
+    d = eigs(j) - eigv(i) - shift
+    if (Abs (c/d) < biglim) return
+
+    ncfj = ncf(j)
+    ncei = nce(i)
+    !
+    !  STORE LMOS FOR POSSIBLE REJECTION, IF LMOS EXPAND TOO MUCH.
+    !
+    jlr = ncocc(j) + 1
+    if (j /= nocc) then
+      jur = ncocc(j+1)
+      jncf = nncf(j+1)
+    else
+      jur = cocc_dim
+      jncf = icocc_dim
+    end if
+    jur = Min (jlr+norbs-1, jur)
+    ilr = ncvir(i) + 1
+    if (i /= nvir) then
+      iur = ncvir(i+1)
+      incv = nnce(i+1)
+    else
+      iur = cvir_dim
+      incv = icvir_dim
+    end if
+    iur = Min (ilr+norbs-1, iur)
+    l = 0
+    do k = jlr, jur
+      l = l + 1
+      storej_t(l) = cocc(k)
+    end do
+    l = 0
+    do k = ilr, iur
+      l = l + 1
+      storei_t(l) = cvir(k)
+    end do
+    !
+    !   STORAGE DONE.
+    !
+    e = Sign (Sqrt(4.d0*c*c+d*d), d)
+    alpha = Sqrt (0.5d0*(1.d0+d/e))
+
+    do
+      beta = -Sign (Sqrt(1.d0-alpha*alpha), c)
+      sumb_acc = sumb_acc + Abs (beta)
+      !
+      ! IDENTIFY THE ATOMS IN THE OCCUPIED LMO.  ATOMS NOT USED ARE
+      ! FLAGGED BY '-1' IN IUSED.
+      !
+      mlf = 0
+      do lf = nncf(j) + 1, nncf(j) + ncf(j)
+        ii = icocc(lf)
+        iused_t(ii) = mlf
+        mlf = mlf + iorbs(ii)
+      end do
+      loopi = ncvir(i)
+      loopj = ncocc(j)
+      mle = 0
+      !
+      !      ROTATION OF PSEUDO-EIGENVECTORS
+      !
+      do le = nnce(i) + 1, nnce(i) + nce(i)
+        mie = icvir(le)
+        latoms_t(mie) = .true.
+        mlff = iused_t(mie) + loopj
+        if (iused_t(mie) >= 0) then
+          !
+          !  TWO BY TWO ROTATION OF ATOMS WHICH ARE COMMON
+          !  TO OCCUPIED LMO J AND VIRTUAL LMO I
+          !
+          do mlee = mle + 1 + loopi, mle + iorbs(mie) + loopi
+            mlff = mlff + 1
+            a = cocc(mlff)
+            b = cvir(mlee)
+            cocc(mlff) = alpha * a + beta * b
+            cvir(mlee) = alpha * b - beta * a
+          end do
+        else
+          !
+          !   FILLED  LMO ATOM 'MIE' DOES NOT EXIST.
+          !   CHECK IF IT SHOULD EXIST
+          !
+          sum = 0.d0
+          do mlee = mle + 1 + loopi, mle + iorbs(mie) + loopi
+            sum = sum + (beta*cvir(mlee)) ** 2
+          end do
+          if (sum > thresh) then
+            if (nncf(j)+ncf(j) >= jncf) exit
+            if (mlf+iorbs(mie)+loopj > jur) exit
+            !
+            !  YES, OCCUPIED LMO ATOM 'MIE' SHOULD EXIST
+            !
+            ncf(j) = ncf(j) + 1
+            icocc(nncf(j)+ncf(j)) = mie
+            !
+            iused_t(mie) = mlf
+            mlf = mlf + iorbs(mie)
+            !
+            !   PUT INTENSITY INTO OCCUPIED LMO ATOM 'MIE'
+            !
+            mlff = iused_t(mie) + loopj
+            do mlee = mle + 1 + loopi, mle + iorbs(mie) + loopi
+              mlff = mlff + 1
+              cocc(mlff) = beta * cvir(mlee)
+              cvir(mlee) = alpha * cvir(mlee)
+            end do
+          end if
+        end if
+        mle = mle + iorbs(mie)
+      end do
+
+      if (le <= nnce(i) + nce(i)) then
+        ! Rejected due to array bounds in occupied expansion.
+        nrej_acc = nrej_acc + 1
+        l = 0
+        do k = jlr, jur
+          l = l + 1
+          cocc(k) = storej_t(l)
+        end do
+        l = 0
+        do k = ilr, iur
+          l = l + 1
+          cvir(k) = storei_t(l)
+        end do
+        ncf(j) = ncfj
+        nce(i) = ncei
+        iused_t(:) = -1
+        latoms_t(:) = .false.
+        if (retry) then
+          alpha = 0.5d0 * (alpha+1.d0)
+          cycle
+        end if
+        return
+      end if
+
+      !
+      !  NOW CHECK ALL ATOMS WHICH WERE IN THE OCCUPIED LMO
+      !  WHICH ARE NOT IN THE VIRTUAL LMO, TO SEE IF THEY
+      !  SHOULD BE IN THE VIRTUAL LMO.
+      !
+      do lf = nncf(j) + 1, nncf(j) + ncf(j)
+        ii = icocc(lf)
+        if ( .not. latoms_t(ii)) then
+          sum = 0.d0
+          do mlff = iused_t(ii) + loopj + 1, iused_t(ii) + loopj + iorbs(ii)
+            sum = sum + (beta*cocc(mlff)) ** 2
+          end do
+          if (sum > thresh) then
+            if (nnce(i)+nce(i) >= incv) exit
+            if (mle+iorbs(ii)+loopi > iur) exit
+            !
+            !  YES, VIRTUAL  LMO ATOM 'II' SHOULD EXIST
+            !
+            nce(i) = nce(i) + 1
+            icvir(nnce(i)+nce(i)) = ii
+            latoms_t(ii) = .true.
+            !
+            !   PUT INTENSITY INTO VIRTUAL  LMO ATOM 'II'
+            !
+            mlff = iused_t(ii) + loopj
+            do mlee = mle + 1 + loopi, mle + iorbs(ii) + loopi
+              mlff = mlff + 1
+              cvir(mlee) = -beta * cocc(mlff)
+              cocc(mlff) = alpha * cocc(mlff)
+            end do
+            mle = mle + iorbs(ii)
+          end if
+        end if
+      end do
+
+      if (lf <= nncf(j) + ncf(j)) then
+        ! Rejected due to array bounds in virtual expansion.
+        nrej_acc = nrej_acc + 1
+        l = 0
+        do k = jlr, jur
+          l = l + 1
+          cocc(k) = storej_t(l)
+        end do
+        l = 0
+        do k = ilr, iur
+          l = l + 1
+          cvir(k) = storei_t(l)
+        end do
+        ncf(j) = ncfj
+        nce(i) = ncei
+        iused_t(:) = -1
+        latoms_t(:) = .false.
+        if (retry) then
+          alpha = 0.5d0 * (alpha+1.d0)
+          cycle
+        end if
+        return
+      end if
+
+      exit
+    end do
+
+    ! Reset counters which have been set.
+    do le = nnce(i) + 1, nnce(i) + nce(i)
+      mie = icvir(le)
+      latoms_t(mie) = .false.
+    end do
+    do lf = nncf(j) + 1, nncf(j) + ncf(j)
+      iused_t(icocc(lf)) = -1
+    end do
+
+  end subroutine process_pair
   end subroutine diagg2
