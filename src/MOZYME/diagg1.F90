@@ -98,15 +98,16 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
     !
     aocc(:) = 0.d0
     !
-    !   IF THE CONTRIBUTION OF AN ATOM IN AN OCCUPIED LMO IS VERY SMALL
-    !   THEN DO NOT USE THAT ATOM IN CALCULATING THE OCCUPIED-VIRTUAL
-    !   INTERACTION.  PUT THE CONTRIBUTIONS INTO AN ARRAY 'AOCC'.
-    !
-    do j = 1, nocc
-        loopj = ncocc(j)
-        kl = 0
-        do kk = nncf(j) + 1, nncf(j) + ncf(j)
-          k1 = icocc(kk)
+	    !   IF THE CONTRIBUTION OF AN ATOM IN AN OCCUPIED LMO IS VERY SMALL
+	    !   THEN DO NOT USE THAT ATOM IN CALCULATING THE OCCUPIED-VIRTUAL
+	    !   INTERACTION.  PUT THE CONTRIBUTIONS INTO AN ARRAY 'AOCC'.
+	    !
+!$omp parallel do default(shared) private(loopj,kl,kk,k1,sum,k) schedule(static)
+	    do j = 1, nocc
+	        loopj = ncocc(j)
+	        kl = 0
+	        do kk = nncf(j) + 1, nncf(j) + ncf(j)
+	          k1 = icocc(kk)
           sum = 0.d0
           do k = nfirst(k1), nlast(k1)
             kl = kl + 1
@@ -118,13 +119,14 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
           !
           aocc(kk) = sum
           !
-        end do
-      !
-    end do
-    !
-    !
-    !    CUTLIM    PRECISION OF PL
-    !
+	        end do
+	      !
+	    end do
+!$omp end parallel do
+	    !
+	    !
+	    !    CUTLIM    PRECISION OF PL
+	    !
     !    1.D-6      0.004
     !    1.D-7      0.00004
     !
@@ -165,8 +167,8 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
 !$omp end single
 		        i_start = ((tid-1) * nvir) / nthreads + 1
 		        i_end = (tid * nvir) / nthreads
-		        est = Max (1024, Min (65536, nij_max / Max (1, nthreads)))
-		        call buffer_reserve (buffers(tid), est)
+			        est = Max (1024, (nij_max + nthreads - 1) / Max (1, nthreads))
+			        call buffer_reserve (buffers(tid), est)
 
 		        allocate (ws_loc(norbs), latoms_loc(numat), avir_loc(numat), aov_loc(numat), &
 		             & jstore(nocc), fstore(nocc))
@@ -663,173 +665,31 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
       end if
         !
     else
-      !
-      !  EVALUATE THE OCCUPIED ENERGY LEVELS
-      !
-        !
-      do i = 1, nocc
-        !
-          loopi = ncocc(i)
-          l = 0
-          do j = nncf(i) + 1, nncf(i) + ncf(i)
-            j1 = icocc(j)
-            sum = 0.d0
-            do k = l + 1, l + iorbs(j1)
-              sum = sum + cocc(k+loopi) ** 2
-            end do
-            l = l + iorbs(j1)
-            !
-            !   AOCC(KK) HOLDS THE SQUARE OF THE CONTRIBUTION OF THE KK'TH ATOM
-            !   IN THE OCCUPIED SET.  NOTE:  THIS IS NOT ATOM KK.
-            !
-            !   AVIR(J1) HOLDS THE SQUARE OF THE CONTRIBUTION OF ATOM J1
-            !   IN THE OCCUPIED SET.  NOTE:  THIS IS NOT THE J1'th ATOM.
-            !
-            avir(j1) = sum
-            !
-            !   AOCC(KK) HOLDS THE SQUARE OF THE CONTRIBUTION OF THE KK'TH ATOM
-            !   IN THE OCCUPIED SET.  NOTE:  THIS IS NOT ATOM KK.
-            !
-            !   AVIR(J1) HOLDS THE SQUARE OF THE CONTRIBUTION OF ATOM J1
-            !   IN THE OCCUPIED SET.  NOTE:  THIS IS NOT THE J1'th ATOM.
-            !
-          end do
-          sum = 0.d0
-          jl = loopi
-          !
-          if (lijbo) then
-            do j = nncf(i) + 1, nncf(i) + ncf(i)
-              j1 = icocc(j)
-              kl = loopi
-              do k = nncf(i) + 1, nncf(i) + ncf(i)
-                k1 = icocc(k)
-                k1j1 = nijbo(k1, j1)
-                if (k1j1 >= 0) then
-                  if (avir(k1)*p(k1j1+1)*aocc(k) >= cutoff) then
-                    !
-                    !  EXTRACT THE ATOM-ATOM INTERSECTION OF FAO
-                    !
-                    if (k1 > j1) then
-                      !
-                      !   LOWER TRIANGLE
-                      !
-                      do jx = 1, iorbs(j1)
-                        sum1 = 0.d0
-                        do i4 = 1, iorbs(k1)
-                          ii = k1j1 + (i4-1) * iorbs(j1) + jx
-                          sum1 = sum1 + fao(ii) * cocc(kl+i4)
-                        end do
-                        sum = sum + cocc(jl+jx) * sum1
-                      end do
-                    else if (k1 < j1) then
-                      !
-                      !   UPPER TRIANGLE
-                      !
-                      do jx = 1, iorbs(j1)
-                        sum1 = 0.d0
-                        do i4 = 1, iorbs(k1)
-                          ii = k1j1 + (jx-1) * iorbs(k1) + i4
-                          sum1 = sum1 + fao(ii) * cocc(kl+i4)
-                        end do
-                        sum = sum + cocc(jl+jx) * sum1
-                      end do
-                    else
-                      !
-                      !   DIAGONAL TERM
-                      !
-                      do jx = 1, iorbs(j1)
-                        sum1 = 0.d0
-                        do j4 = 1, jx
-                          ii = k1j1 + (jx*(jx-1)) / 2 + j4
-                          sum1 = sum1 + fao(ii) * cocc(kl+j4)
-                        end do
-                        ii = k1j1 + (jx*(jx+1)) / 2
-                        do i4 = jx + 1, iorbs(k1)
-                          ii = k1j1 + (i4*(i4-1)) / 2 + jx
-                          sum1 = sum1 + fao(ii) * cocc(kl+i4)
-                        end do
-                        sum = sum + cocc(jl+jx) * sum1
-                      end do
-                    end if
-                  end if
-                end if
-                kl = kl + iorbs(k1)
-              end do
-              !
-              jl = jl + iorbs(j1)
-            end do
-          else
-            do j = nncf(i) + 1, nncf(i) + ncf(i)
-              j1 = icocc(j)
-              kl = loopi
-              do k = nncf(i) + 1, nncf(i) + ncf(i)
-                k1 = icocc(k)
-                k1j1 = ijbo (k1, j1)
-                if (k1j1 >= 0) then
-                  if (avir(k1)*p(k1j1+1)*aocc(k) >= cutoff) then
-                    !
-                    !  EXTRACT THE ATOM-ATOM INTERSECTION OF FAO
-                    !
-                    if (k1 > j1) then
-                      !
-                      !   LOWER TRIANGLE
-                      !
-                      do jx = 1, iorbs(j1)
-                        sum1 = 0.d0
-                        do i4 = 1, iorbs(k1)
-                          ii = k1j1 + (i4-1) * iorbs(j1) + jx
-                          sum1 = sum1 + fao(ii) * cocc(kl+i4)
-                        end do
-                        sum = sum + cocc(jl+jx) * sum1
-                      end do
-                    else if (k1 < j1) then
-                      !
-                      !   UPPER TRIANGLE
-                      !
-                      do jx = 1, iorbs(j1)
-                        sum1 = 0.d0
-                        do i4 = 1, iorbs(k1)
-                          ii = k1j1 + (jx-1) * iorbs(k1) + i4
-                          sum1 = sum1 + fao(ii) * cocc(kl+i4)
-                        end do
-                        sum = sum + cocc(jl+jx) * sum1
-                      end do
-                    else
-                      !
-                      !   DIAGONAL TERM
-                      !
-                      do jx = 1, iorbs(j1)
-                        sum1 = 0.d0
-                        do j4 = 1, jx
-                          ii = k1j1 + (jx*(jx-1)) / 2 + j4
-                          sum1 = sum1 + fao(ii) * cocc(kl+j4)
-                        end do
-                        ii = k1j1 + (jx*(jx+1)) / 2
-                        do i4 = jx + 1, iorbs(k1)
-                          ii = k1j1 + (i4*(i4-1)) / 2 + jx
-                          sum1 = sum1 + fao(ii) * cocc(kl+i4)
-                        end do
-                        sum = sum + cocc(jl+jx) * sum1
-                      end do
-                    end if
-                  end if
-                end if
-                kl = kl + iorbs(k1)
-              end do
-              !
-              jl = jl + iorbs(j1)
-            end do
-          end if
-          !
-          eigs(i) = sum
-          !
-      end do
-            oldlim = tiny * safety * 1.d-3
-      fref = tiny ** 4
-      if (times) then
-        call timer (" AFTER DIAGG1 IN ITER")
-      end if
-    end if
+	      !
+	      !  EVALUATE THE OCCUPIED ENERGY LEVELS
+	      !
+	        !
+#ifdef _OPENMP
+!$omp parallel default(shared) private(avir_loc)
+	      allocate (avir_loc(numat))
+!$omp do schedule(static)
+	      do i = 1, nocc
+	        call build_occupied_energy (i, avir_loc, cutoff)
+	      end do
+!$omp end do
+	      deallocate (avir_loc)
+!$omp end parallel
+#else
+	      do i = 1, nocc
+	        call build_occupied_energy (i, avir(1:numat), cutoff)
+	      end do
+#endif
+	      oldlim = tiny * safety * 1.d-3
+	      fref = tiny ** 4
+	      if (times) then
+	        call timer (" AFTER DIAGG1 IN ITER")
+	      end if
+	    end if
 
 		    ovmax = tiny
 		  contains
@@ -1028,12 +888,135 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
 	        kl = kl + iorbs(k1)
 	      end if
 	    end do
-	    eigv(i) = sum
-	  end subroutine build_virtual
+		    eigv(i) = sum
+		  end subroutine build_virtual
 
-	  subroutine rebuild_couplings (i, ws, latoms, aov, cutoff, flim, oldlim, jstore, fstore, sumt_i, tiny_i, nf)
-	    integer, intent (in) :: i
-	    double precision, dimension (norbs), intent (in) :: ws
+		  subroutine build_occupied_energy (i, avir_occ, cutoff)
+		    integer, intent (in) :: i
+		    double precision, dimension (numat), intent (inout) :: avir_occ
+		    double precision, intent (in) :: cutoff
+
+		    integer :: loopi, l, j, j1, j4, jx, k, k1, k1j1, kl, jl, i4, ii
+		    double precision :: sum, sum1
+
+		    loopi = ncocc(i)
+		    l = 0
+		    do j = nncf(i) + 1, nncf(i) + ncf(i)
+		      j1 = icocc(j)
+		      sum = 0.d0
+		      do k = l + 1, l + iorbs(j1)
+		        sum = sum + cocc(k+loopi) ** 2
+		      end do
+		      l = l + iorbs(j1)
+		      avir_occ(j1) = sum
+		    end do
+
+		    sum = 0.d0
+		    jl = loopi
+		    if (lijbo) then
+		      do j = nncf(i) + 1, nncf(i) + ncf(i)
+		        j1 = icocc(j)
+		        kl = loopi
+		        do k = nncf(i) + 1, nncf(i) + ncf(i)
+		          k1 = icocc(k)
+		          k1j1 = nijbo(k1, j1)
+		          if (k1j1 >= 0) then
+		            if (avir_occ(k1)*p(k1j1+1)*aocc(k) >= cutoff) then
+		              if (k1 > j1) then
+		                do jx = 1, iorbs(j1)
+		                  sum1 = 0.d0
+		                  do i4 = 1, iorbs(k1)
+		                    ii = k1j1 + (i4-1) * iorbs(j1) + jx
+		                    sum1 = sum1 + fao(ii) * cocc(kl+i4)
+		                  end do
+		                  sum = sum + cocc(jl+jx) * sum1
+		                end do
+		              else if (k1 < j1) then
+		                do jx = 1, iorbs(j1)
+		                  sum1 = 0.d0
+		                  do i4 = 1, iorbs(k1)
+		                    ii = k1j1 + (jx-1) * iorbs(k1) + i4
+		                    sum1 = sum1 + fao(ii) * cocc(kl+i4)
+		                  end do
+		                  sum = sum + cocc(jl+jx) * sum1
+		                end do
+		              else
+		                do jx = 1, iorbs(j1)
+		                  sum1 = 0.d0
+		                  do j4 = 1, jx
+		                    ii = k1j1 + (jx*(jx-1)) / 2 + j4
+		                    sum1 = sum1 + fao(ii) * cocc(kl+j4)
+		                  end do
+		                  ii = k1j1 + (jx*(jx+1)) / 2
+		                  do i4 = jx + 1, iorbs(k1)
+		                    ii = k1j1 + (i4*(i4-1)) / 2 + jx
+		                    sum1 = sum1 + fao(ii) * cocc(kl+i4)
+		                  end do
+		                  sum = sum + cocc(jl+jx) * sum1
+		                end do
+		              end if
+		            end if
+		          end if
+		          kl = kl + iorbs(k1)
+		        end do
+		        jl = jl + iorbs(j1)
+		      end do
+		    else
+		      do j = nncf(i) + 1, nncf(i) + ncf(i)
+		        j1 = icocc(j)
+		        kl = loopi
+		        do k = nncf(i) + 1, nncf(i) + ncf(i)
+		          k1 = icocc(k)
+		          k1j1 = ijbo (k1, j1)
+		          if (k1j1 >= 0) then
+		            if (avir_occ(k1)*p(k1j1+1)*aocc(k) >= cutoff) then
+		              if (k1 > j1) then
+		                do jx = 1, iorbs(j1)
+		                  sum1 = 0.d0
+		                  do i4 = 1, iorbs(k1)
+		                    ii = k1j1 + (i4-1) * iorbs(j1) + jx
+		                    sum1 = sum1 + fao(ii) * cocc(kl+i4)
+		                  end do
+		                  sum = sum + cocc(jl+jx) * sum1
+		                end do
+		              else if (k1 < j1) then
+		                do jx = 1, iorbs(j1)
+		                  sum1 = 0.d0
+		                  do i4 = 1, iorbs(k1)
+		                    ii = k1j1 + (jx-1) * iorbs(k1) + i4
+		                    sum1 = sum1 + fao(ii) * cocc(kl+i4)
+		                  end do
+		                  sum = sum + cocc(jl+jx) * sum1
+		                end do
+		              else
+		                do jx = 1, iorbs(j1)
+		                  sum1 = 0.d0
+		                  do j4 = 1, jx
+		                    ii = k1j1 + (jx*(jx-1)) / 2 + j4
+		                    sum1 = sum1 + fao(ii) * cocc(kl+j4)
+		                  end do
+		                  ii = k1j1 + (jx*(jx+1)) / 2
+		                  do i4 = jx + 1, iorbs(k1)
+		                    ii = k1j1 + (i4*(i4-1)) / 2 + jx
+		                    sum1 = sum1 + fao(ii) * cocc(kl+i4)
+		                  end do
+		                  sum = sum + cocc(jl+jx) * sum1
+		                end do
+		              end if
+		            end if
+		          end if
+		          kl = kl + iorbs(k1)
+		        end do
+		        jl = jl + iorbs(j1)
+		      end do
+		    end if
+
+		    eigs(i) = sum
+		  end subroutine build_occupied_energy
+	
+		  subroutine rebuild_couplings (i, ws, latoms, aov, cutoff, flim, oldlim, jstore, fstore, sumt_i, tiny_i, nf)
+		    integer, intent (in) :: i
+		    double precision, dimension (norbs), intent (in) :: ws
 	    logical, dimension (numat), intent (in) :: latoms
 	    double precision, dimension (numat), intent (in) :: aov
 	    double precision, intent (in) :: cutoff, flim, oldlim
