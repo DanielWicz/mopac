@@ -42,7 +42,7 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
 	     & iorbs, icocc, icvir, cocc, cvir
 	    use common_arrays_C, only : eigs, nfirst, nlast, p
 #ifdef _OPENMP
-	    use omp_lib, only: omp_get_max_threads
+	    use omp_lib, only: omp_get_max_threads, omp_get_num_threads, omp_get_thread_num
 #endif
 	    implicit none
 	    integer, intent (in) :: idiagg, nocc, nvir, fmo_dim
@@ -65,9 +65,19 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
 		    double precision, save :: fref, oldlim, safety
 		    double precision :: cutoff, sum, sum1
 #ifdef _OPENMP
+	    type :: diagg1_thread_buffer
+	      integer :: n = 0
+	      integer, allocatable :: i(:), j(:)
+	      double precision, allocatable :: f(:)
+	    end type diagg1_thread_buffer
+	    type(diagg1_thread_buffer), allocatable :: buffers(:)
+	    integer, allocatable :: tid_offset(:)
+	    double precision, allocatable :: sumt_thr(:), tiny_thr(:)
+
 	    logical :: use_parallel_diagg1
+	    integer :: nthreads_used, tid, nthreads, i_start, i_end, est, off, ncopy, pos, ijc_total
 	    integer :: max_threads, nij_max
-	    double precision :: sumt_par, tiny_par
+	    double precision :: sumt_par, tiny_par, sumt_loc, tiny_loc
 	    integer, allocatable :: start_idx(:)
 	    double precision, allocatable :: ws_loc(:), avir_loc(:), aov_loc(:), fstore(:)
 	    logical, allocatable :: latoms_loc(:)
@@ -141,35 +151,108 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
 	      tiny = 0.d0
 		      if (idiagg <= 5 .or. Mod (idiagg, 2) == 0) then
 		        nfmo(1:nvir) = 0
-!$omp parallel default(shared) private(ws_loc, latoms_loc, avir_loc, aov_loc, jstore, fstore, sumt_par, tiny_par, l)
+		        allocate (buffers(max_threads), tid_offset(max_threads), sumt_thr(max_threads), tiny_thr(max_threads))
+		        tid_offset(:) = 0
+		        sumt_thr(:) = 0.d0
+		        tiny_thr(:) = 0.d0
+		        nthreads_used = 1
+!$omp parallel default(shared) private(ws_loc, latoms_loc, avir_loc, aov_loc, jstore, fstore, sumt_loc, tiny_loc, &
+!$omp& sumt_par, tiny_par, l, tid, nthreads, i_start, i_end, est)
+		        tid = omp_get_thread_num() + 1
+		        nthreads = omp_get_num_threads()
+!$omp single
+		        nthreads_used = nthreads
+!$omp end single
+		        i_start = ((tid-1) * nvir) / nthreads + 1
+		        i_end = (tid * nvir) / nthreads
+		        est = Max (1024, Min (65536, nij_max / Max (1, nthreads)))
+		        call buffer_reserve (buffers(tid), est)
+
 		        allocate (ws_loc(norbs), latoms_loc(numat), avir_loc(numat), aov_loc(numat), &
 		             & jstore(nocc), fstore(nocc))
-		        sumt_par = 0.d0
-		        tiny_par = 0.d0
-!$omp do schedule(static) ordered
-		        do i = 1, nvir
-	          call build_virtual (i, ws_loc, latoms_loc, avir_loc, aov_loc, cutoff)
-	          call rebuild_couplings (i, ws_loc, latoms_loc, aov_loc, cutoff, flim, oldlim, jstore, fstore, &
-	               & sumt_par, tiny_par, l)
-!$omp ordered
-	          loopi = ijc
-	          do j = 1, l
-	            if (ijc == nij_max) exit
-	            ijc = ijc + 1
-	            ifmo(1, ijc) = i
-	            ifmo(2, ijc) = jstore(j)
-	            fmo(ijc) = fstore(j)
-	          end do
-	          nfmo(i) = ijc - loopi
-	          sumt = sumt + sumt_par
-	          tiny = Max (tiny, tiny_par)
-!$omp end ordered
-	          sumt_par = 0.d0
-	          tiny_par = 0.d0
-	        end do
-!$omp end do
-	        deallocate (ws_loc, latoms_loc, avir_loc, aov_loc, jstore, fstore)
+		        sumt_loc = 0.d0
+		        tiny_loc = 0.d0
+
+		        do i = i_start, i_end
+		          call build_virtual (i, ws_loc, latoms_loc, avir_loc, aov_loc, cutoff)
+		          call rebuild_couplings (i, ws_loc, latoms_loc, aov_loc, cutoff, flim, oldlim, jstore, fstore, &
+		               & sumt_par, tiny_par, l)
+		          nfmo(i) = l
+		          sumt_loc = sumt_loc + sumt_par
+		          tiny_loc = Max (tiny_loc, tiny_par)
+		          call buffer_append (buffers(tid), i, jstore, fstore, l)
+		        end do
+
+		        sumt_thr(tid) = sumt_loc
+		        tiny_thr(tid) = tiny_loc
+
+		        deallocate (ws_loc, latoms_loc, avir_loc, aov_loc, jstore, fstore)
 !$omp end parallel
+
+		        sumt = 0.d0
+		        tiny = 0.d0
+		        do tid = 1, nthreads_used
+		          sumt = sumt + sumt_thr(tid)
+		          tiny = Max (tiny, tiny_thr(tid))
+		        end do
+
+		        tid_offset(1) = 1
+		        do tid = 2, nthreads_used
+		          tid_offset(tid) = tid_offset(tid-1) + buffers(tid-1)%n
+		        end do
+		        ijc_total = tid_offset(nthreads_used) + buffers(nthreads_used)%n - 1
+
+		        if (ijc_total <= nij_max) then
+		          ijc = ijc_total
+!$omp parallel do default(shared) private(tid, off, ncopy) schedule(static)
+		          do tid = 1, nthreads_used
+		            off = tid_offset(tid)
+		            ncopy = buffers(tid)%n
+		            if (ncopy > 0) then
+		              ifmo(1, off:off+ncopy-1) = buffers(tid)%i(1:ncopy)
+		              ifmo(2, off:off+ncopy-1) = buffers(tid)%j(1:ncopy)
+		              fmo(off:off+ncopy-1) = buffers(tid)%f(1:ncopy)
+		            end if
+		          end do
+!$omp end parallel do
+		        else
+		          ijc = 0
+		          outer_pack: do tid = 1, nthreads_used
+		            i_start = ((tid-1) * nvir) / nthreads_used + 1
+		            i_end = (tid * nvir) / nthreads_used
+		            pos = 0
+		            do i = i_start, i_end
+		              l = nfmo(i)
+		              if (l <= 0) cycle
+		              if (ijc == nij_max) then
+		                nfmo(i) = 0
+		                cycle
+		              end if
+		              ncopy = Min (l, nij_max - ijc)
+		              if (ncopy > 0) then
+		                ifmo(1, ijc+1:ijc+ncopy) = i
+		                ifmo(2, ijc+1:ijc+ncopy) = buffers(tid)%j(pos+1:pos+ncopy)
+		                fmo(ijc+1:ijc+ncopy) = buffers(tid)%f(pos+1:pos+ncopy)
+		                ijc = ijc + ncopy
+		              end if
+		              if (ncopy < l) then
+		                nfmo(i) = ncopy
+		                do j = i + 1, i_end
+		                  nfmo(j) = 0
+		                end do
+		                do j = tid + 1, nthreads_used
+		                  i1 = ((j-1) * nvir) / nthreads_used + 1
+		                  i2 = (j * nvir) / nthreads_used
+		                  nfmo(i1:i2) = 0
+		                end do
+		                exit outer_pack
+		              end if
+		              pos = pos + l
+		            end do
+		          end do outer_pack
+		        end if
+
+		        deallocate (buffers, tid_offset, sumt_thr, tiny_thr)
 		      else
 		        allocate (start_idx(nvir))
 		        start_idx(1) = 1
@@ -750,6 +833,53 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
 
 		    ovmax = tiny
 		  contains
+#ifdef _OPENMP
+		  subroutine buffer_reserve (buf, cap)
+		    type(diagg1_thread_buffer), intent (inout) :: buf
+		    integer, intent (in) :: cap
+		    integer :: new_cap
+		    integer, allocatable :: i_new(:), j_new(:)
+		    double precision, allocatable :: f_new(:)
+		    if (cap <= 0) return
+		    if (.not. allocated (buf%i)) then
+		      new_cap = cap
+		      allocate (buf%i(new_cap), buf%j(new_cap), buf%f(new_cap))
+		      buf%n = 0
+		    else if (size (buf%i) < cap) then
+		      new_cap = cap
+		      allocate (i_new(new_cap), j_new(new_cap), f_new(new_cap))
+		      if (buf%n > 0) then
+		        i_new(1:buf%n) = buf%i(1:buf%n)
+		        j_new(1:buf%n) = buf%j(1:buf%n)
+		        f_new(1:buf%n) = buf%f(1:buf%n)
+		      end if
+		      call move_alloc (i_new, buf%i)
+		      call move_alloc (j_new, buf%j)
+		      call move_alloc (f_new, buf%f)
+		    end if
+		  end subroutine buffer_reserve
+
+		  subroutine buffer_append (buf, i, jlist, flist, nadd)
+		    type(diagg1_thread_buffer), intent (inout) :: buf
+		    integer, intent (in) :: i, nadd
+		    integer, dimension (:), intent (in) :: jlist
+		    double precision, dimension (:), intent (in) :: flist
+		    integer :: needed, cap
+		    if (nadd <= 0) return
+		    needed = buf%n + nadd
+		    if (.not. allocated (buf%i)) then
+		      cap = Max (1024, needed)
+		      call buffer_reserve (buf, cap)
+		    else if (size (buf%i) < needed) then
+		      cap = Max (needed, 2 * size (buf%i))
+		      call buffer_reserve (buf, cap)
+		    end if
+		    buf%i(buf%n+1:needed) = i
+		    buf%j(buf%n+1:needed) = jlist(1:nadd)
+		    buf%f(buf%n+1:needed) = flist(1:nadd)
+		    buf%n = needed
+		  end subroutine buffer_append
+#endif
 		  subroutine build_virtual (i, ws, latoms, avir, aov, cutoff)
 		    integer, intent (in) :: i
 		    double precision, dimension (norbs), intent (inout) :: ws
