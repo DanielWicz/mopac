@@ -261,7 +261,6 @@
                        & iused_t, latoms_t, storei_t, storej_t)
                 end do
 !$omp end do
-!$omp barrier
               end do
 
               deallocate (iused_t, latoms_t, storei_t, storej_t)
