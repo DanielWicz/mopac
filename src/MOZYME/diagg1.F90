@@ -56,9 +56,9 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
 	    double precision, dimension (nvirtual), intent (inout) :: eigv
 		    double precision, dimension (icocc_dim), intent (out) :: aocc
 		    integer, save :: icalcn = 0
-		    integer :: i, i1, i2, i4, ii, j, j1, j2, j4, &
-		         & ij0, jj, jl, jx, k, k1, kk, kl, l, loopi, loopj, kj, i1j1, &
-		         & i1j2, i2j1, i2j2, k1j1
+		    integer :: i, i1, i2, i4, ii, j, j1, j2, j4, prev_i, &
+			         & ij0, jj, jl, jx, k, k1, kk, kl, l, loopi, loopj, kj, i1j1, &
+			         & i1j2, i2j1, i2j2, k1j1
 		    logical :: lij
 		    logical, save :: times
 		    double precision :: cutlim, flim
@@ -159,28 +159,30 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
 		        tiny_thr(:) = 0.d0
 		        nthreads_used = 1
 !$omp parallel default(shared) private(ws_loc, latoms_loc, avir_loc, aov_loc, jstore, fstore, sumt_loc, tiny_loc, &
-!$omp& sumt_par, tiny_par, l, tid, nthreads, i_start, i_end, est)
-		        tid = omp_get_thread_num() + 1
-		        nthreads = omp_get_num_threads()
+!$omp& sumt_par, tiny_par, l, tid, nthreads, i_start, i_end, est, i, prev_i)
+			        tid = omp_get_thread_num() + 1
+			        nthreads = omp_get_num_threads()
 !$omp single
-		        nthreads_used = nthreads
+			        nthreads_used = nthreads
 !$omp end single
 		        i_start = ((tid-1) * nvir) / nthreads + 1
 		        i_end = (tid * nvir) / nthreads
 			        est = Max (1024, (nij_max + nthreads - 1) / Max (1, nthreads))
 			        call buffer_reserve (buffers(tid), est)
 
-		        allocate (ws_loc(norbs), latoms_loc(numat), avir_loc(numat), aov_loc(numat), &
-		             & jstore(nocc), fstore(nocc))
-		        sumt_loc = 0.d0
-		        tiny_loc = 0.d0
+			        allocate (ws_loc(norbs), latoms_loc(numat), avir_loc(numat), aov_loc(numat), &
+			             & jstore(nocc), fstore(nocc))
+			        sumt_loc = 0.d0
+			        tiny_loc = 0.d0
+			        prev_i = 0
 
-		        do i = i_start, i_end
-		          call build_virtual (i, ws_loc, latoms_loc, avir_loc, aov_loc, cutoff)
-		          call rebuild_couplings (i, ws_loc, latoms_loc, aov_loc, cutoff, flim, oldlim, jstore, fstore, &
-		               & sumt_par, tiny_par, l)
-		          nfmo(i) = l
-		          sumt_loc = sumt_loc + sumt_par
+			        do i = i_start, i_end
+			          call build_virtual (i, prev_i, ws_loc, latoms_loc, avir_loc, aov_loc, cutoff)
+			          prev_i = i
+			          call rebuild_couplings (i, ws_loc, latoms_loc, aov_loc, cutoff, flim, oldlim, jstore, fstore, &
+			               & sumt_par, tiny_par, l)
+			          nfmo(i) = l
+			          sumt_loc = sumt_loc + sumt_par
 		          tiny_loc = Max (tiny_loc, tiny_par)
 		          call buffer_append (buffers(tid), i, jstore, fstore, l)
 		        end do
@@ -265,27 +267,31 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
 		        ijc = Min (ijc, nij_max)
 		        sumt_par = 0.d0
 		        tiny_par = 0.d0
-!$omp parallel default(shared) private(ws_loc, latoms_loc, avir_loc, aov_loc, l, sum, loopj, kl, jj, j, k, kk, k1) &
+!$omp parallel default(shared) private(ws_loc, latoms_loc, avir_loc, aov_loc, l, sum, loopj, kl, jj, j, k, kk, k1, prev_i) &
 !$omp& reduction(+:sumt_par) reduction(max:tiny_par)
-	        allocate (ws_loc(norbs), latoms_loc(numat), avir_loc(numat), aov_loc(numat))
+		        allocate (ws_loc(norbs), latoms_loc(numat), avir_loc(numat), aov_loc(numat))
+		        prev_i = 0
 !$omp do schedule(static)
-	        do i = 1, nvir
-	          call build_virtual (i, ws_loc, latoms_loc, avir_loc, aov_loc, cutoff)
-	          l = nfmo(i)
-	          if (l <= 0) cycle
-		          do jj = 1, l
-		            if (start_idx(i)+jj-1 > nij_max) exit
+		        do i = 1, nvir
+		          call build_virtual (i, prev_i, ws_loc, latoms_loc, avir_loc, aov_loc, cutoff)
+		          prev_i = i
+		          l = nfmo(i)
+		          if (l <= 0) cycle
+			          do jj = 1, l
+			            if (start_idx(i)+jj-1 > nij_max) exit
 		            j = ifmo(2, start_idx(i)+jj-1)
 		            loopj = ncocc(j)
-		            sum = 0.d0
-		            kl = 0
-		            do kk = nncf(j) + 1, nncf(j) + ncf(j)
-		              k1 = icocc(kk)
-	              if (aov_loc(k1)*aocc(kk) < cutoff .or. .not. latoms_loc(k1)) then
-	                kl = kl + iorbs(k1)
-	              else
-	                do k = nfirst(k1), nlast(k1)
-	                  kl = kl + 1
+			            sum = 0.d0
+			            kl = 0
+			            do kk = nncf(j) + 1, nncf(j) + ncf(j)
+			              k1 = icocc(kk)
+		              if (.not. latoms_loc(k1)) then
+		                kl = kl + iorbs(k1)
+		              else if (aov_loc(k1)*aocc(kk) < cutoff) then
+		                kl = kl + iorbs(k1)
+		              else
+		                do k = nfirst(k1), nlast(k1)
+		                  kl = kl + 1
 	                  sum = sum + ws_loc(k) * cocc(kl+loopj)
 	                end do
 	              end if
@@ -740,21 +746,29 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
 		    buf%n = needed
 		  end subroutine buffer_append
 #endif
-		  subroutine build_virtual (i, ws, latoms, avir, aov, cutoff)
-		    integer, intent (in) :: i
-		    double precision, dimension (norbs), intent (inout) :: ws
-		    logical, dimension (numat), intent (inout) :: latoms
-		    double precision, dimension (numat), intent (inout) :: avir, aov
-	    double precision, intent (in) :: cutoff
-	    integer :: loopi, l, j, j1, jx, k, k1, kk, kj, kl, ii, i4
-	    double precision :: sum
+			  subroutine build_virtual (i, prev_i, ws, latoms, avir, aov, cutoff)
+			    integer, intent (in) :: i
+			    integer, intent (in) :: prev_i
+			    double precision, dimension (norbs), intent (inout) :: ws
+			    logical, dimension (numat), intent (inout) :: latoms
+			    double precision, dimension (numat), intent (inout) :: avir, aov
+		    double precision, intent (in) :: cutoff
+		    integer :: loopi, l, j, j1, jx, k, k1, kk, kj, kl, ii, i4
+		    double precision :: sum
 
-	    loopi = ncvir(i)
-	    latoms(:) = .false.
-	    l = 0
-	    do j = nnce(i) + 1, nnce(i) + nce(i)
-	      j1 = icvir(j)
-	      sum = 0.d0
+		    loopi = ncvir(i)
+		    if (prev_i > 0) then
+		      do j = nnce(prev_i) + 1, nnce(prev_i) + nce(prev_i)
+		        j1 = icvir(j)
+		        latoms(j1) = .false.
+		      end do
+		    else
+		      latoms(:) = .false.
+		    end if
+		    l = 0
+		    do j = nnce(i) + 1, nnce(i) + nce(i)
+		      j1 = icvir(j)
+		      sum = 0.d0
 	      do k = l + 1, l + iorbs(j1)
 	        sum = sum + cvir(k+loopi) ** 2
 	      end do
@@ -861,23 +875,19 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
 	          kl = kl + iorbs(k1)
 	        end do
 	      end do
-	    end if
+		    end if
+		    do j = nnce(i) + 1, nnce(i) + nce(i)
+		      j1 = icvir(j)
+		      sum = 0.d0
+		      do k = nfirst(j1), nlast(j1)
+		        sum = sum + ws(k) ** 2
+		      end do
+		      aov(j1) = sum
+		    end do
 
-	    do j = 1, numat
-	      if (latoms(j)) then
-	        sum = 0.d0
-	        do k = nfirst(j), nlast(j)
-	          sum = sum + ws(k) ** 2
-	        end do
-	        aov(j) = sum
-	      else
-	        aov(j) = 0.d0
-	      end if
-	    end do
-
-	    sum = 0.d0
-	    kl = loopi
-	    do kk = nnce(i) + 1, nnce(i) + nce(i)
+		    sum = 0.d0
+		    kl = loopi
+		    do kk = nnce(i) + 1, nnce(i) + nce(i)
 	      k1 = icvir(kk)
 	      if (aov(k1)*avir(k1) > cutoff) then
 	        do k = nfirst(k1), nlast(k1)
@@ -1069,7 +1079,9 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
 	            kl = 0
 	            do kk = nncf(j) + 1, nncf(j) + ncf(j)
 	              k1 = icocc(kk)
-	              if (aocc(kk)*aov(k1) < cutoff .or. .not. latoms(k1)) then
+	              if (.not. latoms(k1)) then
+	                kl = kl + iorbs(k1)
+	              else if (aocc(kk)*aov(k1) < cutoff) then
 	                kl = kl + iorbs(k1)
 	              else
 	                lij = .true.
@@ -1120,7 +1132,9 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
 	            kl = 0
 	            do kk = nncf(j) + 1, nncf(j) + ncf(j)
 	              k1 = icocc(kk)
-	              if (aocc(kk)*aov(k1) < cutoff .or. .not. latoms(k1)) then
+	              if (.not. latoms(k1)) then
+	                kl = kl + iorbs(k1)
+	              else if (aocc(kk)*aov(k1) < cutoff) then
 	                kl = kl + iorbs(k1)
 	              else
 	                lij = .true.
