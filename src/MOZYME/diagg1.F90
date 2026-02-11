@@ -501,10 +501,11 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
 	                  j2 = j1
 	                end if
 	                !
-	                i1j1 = nijbo(i1, j1)
-	                i1j2 = nijbo(i1, j2)
-	                i2j1 = nijbo(i2, j1)
-	                i2j2 = nijbo(i2, j2)
+	                ! nijbo is symmetric; use (j,i) for better memory locality.
+	                i1j1 = nijbo(j1, i1)
+	                i1j2 = nijbo(j2, i1)
+	                i2j1 = nijbo(j1, i2)
+	                i2j2 = nijbo(j2, i2)
 	                !
 	                if (i1j1 >= 0 .or. i1j2 >= 0 .or. i2j1 >= 0 .or. i2j2 >= 0) then
 	                  sum = 0.d0
@@ -1060,10 +1061,11 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
 	          j2 = j1
 	        end if
 
-	        i1j1 = nijbo(i1, j1)
-	        i1j2 = nijbo(i1, j2)
-	        i2j1 = nijbo(i2, j1)
-	        i2j2 = nijbo(i2, j2)
+	        ! nijbo is symmetric; use (j,i) for better memory locality.
+	        i1j1 = nijbo(j1, i1)
+	        i1j2 = nijbo(j2, i1)
+	        i2j1 = nijbo(j1, i2)
+	        i2j2 = nijbo(j2, i2)
 
 	        if (i1j1 >= 0 .or. i1j2 >= 0 .or. i2j1 >= 0 .or. i2j2 >= 0) then
 	          sum = 0.d0
