@@ -54,28 +54,29 @@
     integer, dimension (2) :: nrejct
     data nrejct / 2 * 0 /
 #ifdef _OPENMP
-    integer, parameter :: mode_level = 1, mode_task = 2
-    double precision, parameter :: tune_alpha = 0.25d0, tune_switch_margin = 1.02d0
-    integer, parameter :: tune_explore_period = 24
-    integer :: alloc_stat, max_threads, tid, diagg2_threads, width_hint
-    integer :: lvl, max_level, nactive, pos
-    integer :: batch_start, batch_end, batch_target, batch_edges
-    integer :: batch_min, batch_max
-    integer :: i_task, j_task
-    integer :: mode_selected, mode_used, tune_slot
-    integer :: tune_calls_slot
+	    integer, parameter :: mode_level = 1, mode_task = 2
+	    double precision, parameter :: tune_alpha = 0.25d0, tune_switch_margin = 1.02d0
+	    integer, parameter :: tune_explore_period = 24
+	    integer :: alloc_stat, max_threads, tid, diagg2_threads, width_hint
+	    integer :: lvl, max_level, nactive, pos
+	    integer :: batch_start, batch_end, batch_target, batch_edges
+	    integer :: batch_min, batch_max
+	    integer :: i_task, j_task
+	    integer :: mode_selected, mode_used, tune_slot
+	    integer :: tune_calls_slot
     logical :: task_capable, force_explore
     double precision :: t_start, elapsed, edge_cost
-    integer, allocatable :: edge_level(:), last_occ(:), last_vir(:)
-    integer, allocatable :: level_count(:), level_offset(:), level_pos(:), level_edges(:)
-    integer, allocatable, save :: iused_ws(:,:)
-    logical, allocatable, save :: latoms_ws(:,:)
-    double precision, allocatable, save :: storei_ws(:,:), storej_ws(:,:)
-    double precision, allocatable :: sumb_thread(:)
-    integer, allocatable :: nrej_thread(:)
-    integer, save :: ws_numat = 0, ws_norbs = 0, ws_nthreads = 0
-    logical :: need_ws_resize
-    logical :: active
+	    integer, allocatable :: edge_level(:), active_edges(:), last_occ(:), last_vir(:)
+	    integer, allocatable :: rem_edges(:), next_edges(:)
+	    integer, allocatable :: level_count(:), level_offset(:), level_pos(:), level_edges(:)
+	    integer, allocatable, save :: iused_ws(:,:)
+	    logical, allocatable, save :: latoms_ws(:,:)
+	    double precision, allocatable, save :: storei_ws(:,:), storej_ws(:,:)
+	    double precision, allocatable :: sumb_thread(:)
+	    integer, allocatable :: nrej_thread(:)
+	    logical :: need_ws_resize
+	    logical :: active
+	    integer :: occ_span_max, vir_span_max, nrem, nnext, iedge
     integer, allocatable, save :: tune_calls(:), tune_task_samples(:), tune_level_samples(:)
     integer, allocatable, save :: tune_batch(:), tune_batch_step(:), tune_batch_dir(:)
     double precision, allocatable, save :: tune_task_cost(:), tune_level_cost(:), tune_prev_task_cost(:)
@@ -185,23 +186,23 @@
     lij = 0
     use_parallel_diagg2 = .false.
 #ifdef _OPENMP
-    max_threads = omp_get_max_threads()
-    use_parallel_diagg2 = (max_threads > 1 .and. nij > 64)
-    if (use_parallel_diagg2) then
-      allocate (edge_level(nij), last_occ(nocc), last_vir(nvir), stat=alloc_stat)
-      if (alloc_stat /= 0) then
-        call mopend("Insufficient memory to run DIAGG2 (parallel scheduling)")
-        use_parallel_diagg2 = .false.
-      else
-        edge_level(:) = 0
-        last_occ(:) = 0
-        last_vir(:) = 0
-        max_level = 0
-        nactive = 0
-
-        do ij = 1, nij
-          i = ifmo(1, ij)
-          j = ifmo(2, ij)
+	    max_threads = omp_get_max_threads()
+	    use_parallel_diagg2 = (max_threads > 1 .and. nij > 64)
+	    if (use_parallel_diagg2) then
+	      allocate (edge_level(nij), active_edges(nij), rem_edges(nij), next_edges(nij), &
+	           & last_occ(nocc), last_vir(nvir), stat=alloc_stat)
+	      if (alloc_stat /= 0) then
+	        call mopend("Insufficient memory to run DIAGG2 (parallel scheduling)")
+	        use_parallel_diagg2 = .false.
+	      else
+	        edge_level(:) = 0
+	        nactive = 0
+	        !
+	        ! Filter active pairs using the same tiny/biglim criterion as the rotation kernel.
+	        !
+	        do ij = 1, nij
+	          i = ifmo(1, ij)
+	          j = ifmo(2, ij)
 
           active = .true.
           if (tiny >= 0.d0) then
@@ -218,64 +219,113 @@
             end if
           end if
 
-          if (active) then
-            lvl = Max (last_occ(j), last_vir(i)) + 1
-            edge_level(ij) = lvl
-            last_occ(j) = lvl
-            last_vir(i) = lvl
-            if (lvl > max_level) max_level = lvl
-            nactive = nactive + 1
-          end if
-        end do
+	          if (active) then
+	            nactive = nactive + 1
+	            active_edges(nactive) = ij
+	          end if
+	        end do
 
-        if (nactive > 0) then
-          allocate (level_count(max_level), level_offset(max_level+1), level_pos(max_level), &
-               & level_edges(nactive), stat=alloc_stat)
-          if (alloc_stat /= 0) then
-            call mopend("Insufficient memory to run DIAGG2 (parallel scheduling)")
-            use_parallel_diagg2 = .false.
-          else
-            level_count(:) = 0
-            do ij = 1, nij
-              lvl = edge_level(ij)
-              if (lvl > 0) level_count(lvl) = level_count(lvl) + 1
-            end do
+	        if (nactive > 0) then
+	          !
+	          ! Eq. (D1): level schedule by repeated maximal matching.
+	          ! Each level k is a matching M_k (no repeated occupied/virtual indices).
+	          ! This reduces barrier depth vs. strict edge-order list scheduling.
+	          !
+	          last_occ(:) = 0
+	          last_vir(:) = 0
+	          rem_edges(1:nactive) = active_edges(1:nactive)
+	          nrem = nactive
+	          max_level = 0
+	          do while (nrem > 0)
+	            max_level = max_level + 1
+	            nnext = 0
+	            do iedge = 1, nrem
+	              ij = rem_edges(iedge)
+	              i = ifmo(1, ij)
+	              j = ifmo(2, ij)
+	              if (last_occ(j) == max_level .or. last_vir(i) == max_level) then
+	                nnext = nnext + 1
+	                next_edges(nnext) = ij
+	              else
+	                edge_level(ij) = max_level
+	                last_occ(j) = max_level
+	                last_vir(i) = max_level
+	              end if
+	            end do
+	            if (nnext > 0) rem_edges(1:nnext) = next_edges(1:nnext)
+	            nrem = nnext
+	          end do
+	
+	          allocate (level_count(max_level), level_offset(max_level+1), level_pos(max_level), &
+	               & level_edges(nactive), stat=alloc_stat)
+	          if (alloc_stat /= 0) then
+	            call mopend("Insufficient memory to run DIAGG2 (parallel scheduling)")
+	            use_parallel_diagg2 = .false.
+	          else
+	            level_count(:) = 0
+	            do iedge = 1, nactive
+	              ij = active_edges(iedge)
+	              lvl = edge_level(ij)
+	              level_count(lvl) = level_count(lvl) + 1
+	            end do
 
             level_offset(1) = 1
             do lvl = 1, max_level
               level_offset(lvl+1) = level_offset(lvl) + level_count(lvl)
             end do
 
-            level_pos(:) = level_offset(1:max_level)
-	            do ij = 1, nij
+	            level_pos(:) = level_offset(1:max_level)
+	            do iedge = 1, nactive
+	              ij = active_edges(iedge)
 	              lvl = edge_level(ij)
-	              if (lvl > 0) then
-	                pos = level_pos(lvl)
-	                level_edges(pos) = ij
-	                level_pos(lvl) = pos + 1
-	              end if
+	              pos = level_pos(lvl)
+	              level_edges(pos) = ij
+	              level_pos(lvl) = pos + 1
 	            end do
 
-	            ! Previous-commit improvement kept here: adaptive team sizing from level width.
-	            ! Eq. (0): width_hint = ceil(nactive / max_level)
-	            !         diagg2_threads = min(max_threads, 2*width_hint, nactive)
-	            width_hint = Max (1, (nactive + max_level - 1) / max_level)
-	            diagg2_threads = Min (max_threads, Max (1, 2 * width_hint))
-	            diagg2_threads = Min (diagg2_threads, nactive)
+		            ! Previous-commit improvement kept here: adaptive team sizing from level width.
+		            ! Eq. (0): width_hint = ceil(nactive / max_level)
+		            !         diagg2_threads = min(max_threads, 2*width_hint, nactive)
+		            width_hint = Max (1, (nactive + max_level - 1) / max_level)
+		            diagg2_threads = Min (max_threads, Max (1, 2 * width_hint))
+		            diagg2_threads = Min (diagg2_threads, nactive)
 
-	            if (diagg2_threads > 1) then
-	              need_ws_resize = .true.
-	              ! Previous-commit improvement kept here: persistent per-thread scratch reuse.
-	              ! Allocation is skipped when dimensions already satisfy:
-	              !   ws_rows >= required_rows and ws_cols >= diagg2_threads
-	              if (allocated(iused_ws) .and. allocated(latoms_ws) .and. allocated(storei_ws) .and. allocated(storej_ws)) then
-	                if (size(iused_ws,1) >= numat .and. size(iused_ws,2) >= diagg2_threads .and. &
-	                   & size(latoms_ws,1) >= numat .and. size(latoms_ws,2) >= diagg2_threads .and. &
-	                   & size(storei_ws,1) >= norbs .and. size(storei_ws,2) >= diagg2_threads .and. &
-	                   & size(storej_ws,1) >= norbs .and. size(storej_ws,2) >= diagg2_threads) then
-	                  need_ws_resize = .false.
-	                end if
-	              end if
+		            if (diagg2_threads > 1) then
+		              occ_span_max = 1
+		              do j = 1, nocc
+		                jlr = ncocc(j) + 1
+		                if (j /= nocc) then
+		                  jur = ncocc(j+1)
+		                else
+		                  jur = cocc_dim
+		                end if
+		                jur = Min (jlr+norbs-1, jur)
+		                occ_span_max = Max (occ_span_max, jur - jlr + 1)
+		              end do
+		              vir_span_max = 1
+		              do i = 1, nvir
+		                ilr = ncvir(i) + 1
+		                if (i /= nvir) then
+		                  iur = ncvir(i+1)
+		                else
+		                  iur = cvir_dim
+		                end if
+		                iur = Min (ilr+norbs-1, iur)
+		                vir_span_max = Max (vir_span_max, iur - ilr + 1)
+		              end do
+		              need_ws_resize = .true.
+		              ! Previous-commit improvement kept here: persistent per-thread scratch reuse.
+		              ! Allocation is skipped when dimensions already satisfy:
+		              !   ws_rows >= required_rows and ws_cols >= diagg2_threads.
+		              ! Eq. (D2): backup rows are bounded by max reserved LMO span, not global norbs.
+		              if (allocated(iused_ws) .and. allocated(latoms_ws) .and. allocated(storei_ws) .and. allocated(storej_ws)) then
+		                if (size(iused_ws,1) >= numat .and. size(iused_ws,2) >= diagg2_threads .and. &
+		                   & size(latoms_ws,1) >= numat .and. size(latoms_ws,2) >= diagg2_threads .and. &
+		                   & size(storei_ws,1) >= vir_span_max .and. size(storei_ws,2) >= diagg2_threads .and. &
+		                   & size(storej_ws,1) >= occ_span_max .and. size(storej_ws,2) >= diagg2_threads) then
+		                  need_ws_resize = .false.
+		                end if
+		              end if
 
 	              if (need_ws_resize) then
 	                if (allocated(iused_ws)) deallocate (iused_ws)
@@ -283,16 +333,14 @@
 	                if (allocated(storei_ws)) deallocate (storei_ws)
 	                if (allocated(storej_ws)) deallocate (storej_ws)
 
-	                ! Scratch footprint scales as O((numat + norbs)*threads), allocated once and reused.
-	                allocate (iused_ws(numat, diagg2_threads), latoms_ws(numat, diagg2_threads), &
-	                     & storei_ws(norbs, diagg2_threads), storej_ws(norbs, diagg2_threads), stat=alloc_stat)
-	                if (alloc_stat /= 0) then
-	                  call mopend("Insufficient memory to run DIAGG2 (parallel scratch workspace)")
-	                end if
-	                ws_numat = numat
-	                ws_norbs = norbs
-	                ws_nthreads = diagg2_threads
-	              end if
+		                ! Scratch footprint scales as O((numat + span_occ + span_vir)*threads), reused.
+		                allocate (iused_ws(numat, diagg2_threads), latoms_ws(numat, diagg2_threads), &
+		                     & storei_ws(vir_span_max, diagg2_threads), &
+		                     & storej_ws(occ_span_max, diagg2_threads), stat=alloc_stat)
+		                if (alloc_stat /= 0) then
+		                  call mopend("Insufficient memory to run DIAGG2 (parallel scratch workspace)")
+		                end if
+		              end if
 
 	              if (.not. allocated(tune_calls) .or. size(tune_calls) < max_threads) then
 	                if (allocated(tune_calls)) deallocate (tune_calls)
@@ -376,47 +424,39 @@
 	                mode_used = mode_level
 	              end if
 
-	              if (mode_used == mode_task) then
-	                sumb_thread(:) = 0.d0
-	                nrej_thread(:) = 0
-	                batch_min = Max (32, 4*diagg2_threads)
-	                batch_max = Max (batch_min, Min (nactive, 8192))
-	                batch_target = Min (batch_max, Max (batch_min, tune_batch(tune_slot)))
+		              if (mode_used == mode_task) then
+		                sumb_thread(:) = 0.d0
+		                nrej_thread(:) = 0
+		                batch_min = Max (32, 4*diagg2_threads)
+		                batch_max = Max (batch_min, Min (nactive, 8192))
+		                batch_target = Min (batch_max, Max (batch_min, tune_batch(tune_slot)))
 
-	                t_start = omp_get_wtime()
+		                t_start = omp_get_wtime()
 !$omp parallel num_threads(diagg2_threads) default(shared) &
-!$omp& private(ij, lvl, pos, tid, i_task, j_task, batch_start, batch_end, batch_edges)
-	                tid = omp_get_thread_num() + 1
-	                iused_ws(:, tid) = -1
-	                latoms_ws(:, tid) = .false.
+!$omp& private(ij, pos, tid, i_task, j_task, batch_start, batch_end)
+		                tid = omp_get_thread_num() + 1
+		                iused_ws(:, tid) = -1
+		                latoms_ws(:, tid) = .false.
 !$omp single
-	                batch_start = 1
-	                do while (batch_start <= max_level)
-	                  batch_end = batch_start
-	                  batch_edges = 0
-	                  do while (batch_end <= max_level .and. batch_edges < batch_target)
-	                    batch_edges = batch_edges + level_count(batch_end)
-	                    batch_end = batch_end + 1
-	                  end do
-	                  batch_end = Max (batch_start, batch_end - 1)
-	                  do lvl = batch_start, batch_end
-	                    do pos = level_offset(lvl), level_offset(lvl+1) - 1
-	                      ij = level_edges(pos)
-	                      i_task = ifmo(1, ij)
-	                      j_task = ifmo(2, ij)
-	                      ! Two tasks are independent iff they do not share indices:
-	                      !   (i1 /= i2) AND (j1 /= j2)
-	                      ! Dependence tokens (last_vir(i), last_occ(j)) enforce this relation.
+		                batch_start = 1
+		                do while (batch_start <= nactive)
+		                  batch_end = Min (nactive, batch_start + batch_target - 1)
+		                  do pos = batch_start, batch_end
+		                    ij = active_edges(pos)
+		                    i_task = ifmo(1, ij)
+		                    j_task = ifmo(2, ij)
+		                    ! Two tasks are independent iff they do not share indices:
+		                    !   (i1 /= i2) AND (j1 /= j2)
+		                    ! Dependence tokens (last_vir(i), last_occ(j)) enforce this relation.
 !$omp task default(shared) firstprivate(ij, i_task, j_task) private(tid) &
 !$omp& depend(inout:last_occ(j_task), last_vir(i_task))
-	                      tid = omp_get_thread_num() + 1
-	                      call process_pair (ij, retry, tiny, biglim, sumb_thread(tid), nrej_thread(tid), &
-	                           & iused_ws(:,tid), latoms_ws(:,tid), storei_ws(:,tid), storej_ws(:,tid))
+		                    tid = omp_get_thread_num() + 1
+		                    call process_pair (ij, retry, tiny, biglim, sumb_thread(tid), nrej_thread(tid), &
+		                         & iused_ws(:,tid), latoms_ws(:,tid), storei_ws(:,tid), storej_ws(:,tid))
 !$omp end task
-	                    end do
-	                  end do
+		                  end do
 !$omp taskwait
-	                  batch_start = batch_end + 1
+		                  batch_start = batch_end + 1
 	                end do
 !$omp end single
 !$omp end parallel
@@ -484,31 +524,37 @@
 	                sumb = sumb_local
 	                nrej = nrej_local
 	              end if
-	            else
-	              use_parallel_diagg2 = .false.
-	            end if
+		            else
+		              use_parallel_diagg2 = .false.
+		            end if
 
-	            deallocate (level_edges, level_pos, level_offset, level_count)
+		            deallocate (level_edges, level_pos, level_offset, level_count)
 	          end if
 	        end if
 
-        deallocate (edge_level, last_occ, last_vir)
-      end if
-    end if
+	        deallocate (edge_level, active_edges, rem_edges, next_edges, last_occ, last_vir)
+	      end if
+	    end if
 #endif
 
     if (.not. use_parallel_diagg2) then
       outer_loop: do ij = 1, nij
         i = ifmo(1, ij)
         j = ifmo(2, ij)
-        if (Abs (fmo(ij)) >= tiny) then
-          c = fmo(ij) * const
-          d = eigs(j) - eigv(i) - shift
-          if (Abs (c/d) >= biglim) then
-            ncfj = ncf(j)
-            ncei = nce(i)
-        !
-        !  STORE LMOS FOR POSSIBLE REJECTION, IF LMOS EXPAND TOO MUCH.
+	        if (Abs (fmo(ij)) >= tiny) then
+	          c = fmo(ij) * const
+	          d = eigs(j) - eigv(i) - shift
+	          if (biglim >= 0.d0) then
+	            if (d == 0.d0) then
+	              if (Abs (c) <= 0.d0) cycle outer_loop
+	            else if (Abs (c/d) < biglim) then
+	              cycle outer_loop
+	            end if
+	          end if
+	            ncfj = ncf(j)
+	            ncei = nce(i)
+	        !
+	        !  STORE LMOS FOR POSSIBLE REJECTION, IF LMOS EXPAND TOO MUCH.
         !
             jlr = ncocc(j) + 1
             if (j /= nocc) then
@@ -680,41 +726,52 @@
               latoms(mie) = .false.
             end do
           !
-            do lf = nncf(j) + 1, nncf(j) + ncf(j)
-              iused(icocc(lf)) = -1
-            end do
-          end if
-        end if
-      end do outer_loop
-    end if
+	            do lf = nncf(j) + 1, nncf(j) + ncf(j)
+	              iused(icocc(lf)) = -1
+	            end do
+	        end if
+	      end do outer_loop
+	    end if
     nrejct(2) = nrejct(1)
     nrejct(1) = nrej
     if (times) then
       call timer (" AFTER DIAGG2 IN ITER")
     end if
   contains
-  subroutine process_pair (ij, retry, tiny, biglim, sumb_acc, nrej_acc, iused_t, latoms_t, storei_t, storej_t)
+	  subroutine process_pair (ij, retry, tiny, biglim, sumb_acc, nrej_acc, iused_t, latoms_t, storei_t, storej_t)
     integer, intent (in) :: ij
     logical, intent (in) :: retry
     double precision, intent (in) :: tiny, biglim
     double precision, intent (inout) :: sumb_acc
-    integer, intent (inout) :: nrej_acc
-    integer, dimension (numat), intent (inout) :: iused_t
-    logical, dimension (numat), intent (inout) :: latoms_t
-    double precision, dimension (norbs), intent (inout) :: storei_t, storej_t
+	    integer, intent (inout) :: nrej_acc
+	    integer, dimension (numat), intent (inout) :: iused_t
+	    logical, dimension (numat), intent (inout) :: latoms_t
+	    double precision, dimension (:), intent (inout) :: storei_t, storej_t
 
     integer :: i, j, ii, jur, l, ilr, incv, iur, jlr, jncf, k, le, lf, loopi, loopj
     integer :: mie, mle, mlee, mlf, mlff, ncei, ncfj
     integer :: njlen, nilen
     double precision :: a, alpha, b, beta, c, d, e, sum
 
-    i = ifmo(1, ij)
-    j = ifmo(2, ij)
-    if (Abs (fmo(ij)) < tiny) return
+	    i = ifmo(1, ij)
+	    j = ifmo(2, ij)
+	    if (tiny >= 0.d0) then
+	      if (Abs (fmo(ij)) < tiny) return
+	    end if
 
-    c = fmo(ij) * const
-    d = eigs(j) - eigv(i) - shift
-    if (Abs (c/d) < biglim) return
+	    c = fmo(ij) * const
+	    d = eigs(j) - eigv(i) - shift
+	    !
+	    ! Eq. (E1): pair is active when |c/d| >= biglim (or |c|>0 when d=0).
+	    ! Guarding d=0 keeps scheduler and kernel predicates identical.
+	    !
+	    if (biglim >= 0.d0) then
+	      if (d == 0.d0) then
+	        if (Abs (c) <= 0.d0) return
+	      else if (Abs (c/d) < biglim) then
+	        return
+	      end if
+	    end if
 
     ncfj = ncf(j)
     ncei = nce(i)
@@ -738,12 +795,21 @@
       iur = cvir_dim
       incv = icvir_dim
     end if
-    iur = Min (ilr+norbs-1, iur)
-    njlen = jur - jlr + 1
-    nilen = iur - ilr + 1
-    ! Previous-commit improvement kept here: contiguous backup copy for rollback path.
-    storej_t(1:njlen) = cocc(jlr:jur)
-    storei_t(1:nilen) = cvir(ilr:iur)
+	    iur = Min (ilr+norbs-1, iur)
+	    njlen = jur - jlr + 1
+	    nilen = iur - ilr + 1
+	    !
+	    ! Safety guard: required backup lengths must satisfy
+	    !   njlen <= size(storej_t), nilen <= size(storei_t)
+	    ! to avoid out-of-bounds in rollback buffers.
+	    !
+	    if (njlen > size(storej_t) .or. nilen > size(storei_t)) then
+	      nrej_acc = nrej_acc + 1
+	      return
+	    end if
+	    ! Previous-commit improvement kept here: contiguous backup copy for rollback path.
+	    storej_t(1:njlen) = cocc(jlr:jur)
+	    storei_t(1:nilen) = cvir(ilr:iur)
     !
     !   STORAGE DONE.
     !

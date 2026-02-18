@@ -1,0 +1,5 @@
+worst_scaling_kernel_at_t16=diagg2_speedup
+diagg1_speedup=4.60873147
+diagg2_speedup=2.58040201
+density_speedup=4.40284620
+buildf_speedup=5.63096501

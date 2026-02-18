@@ -58,30 +58,38 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
 		    integer, save :: icalcn = 0
 		    integer :: i, i1, i2, i4, ii, j, j1, j2, j4, prev_i, &
 			         & ij0, jj, jl, jx, k, k1, kk, kl, l, loopi, loopj, kj, i1j1, &
-			         & i1j2, i2j1, i2j2, k1j1
-		    logical :: lij
-		    logical, save :: times
-		    double precision :: cutlim, flim
-		    double precision, save :: fref, oldlim, safety
-		    double precision :: cutoff, sum, sum1
+			         & i1j2, i2j1, i2j2, k1j1, src_atom, dst_atom, aidx, pos, &
+			         & occ_anchor_refs, n_anchor_atoms, n_neighbor_refs
+			    logical :: lij
+			    logical, save :: times
+			    double precision :: cutlim, flim
+			    double precision, save :: fref, oldlim, safety
+			    double precision :: cutoff, sum, sum1
+		    integer, allocatable :: occ_anchor1(:), occ_anchor2(:)
+		    integer, allocatable :: occ_anchor_count(:), occ_anchor_offset(:), occ_anchor_fill(:), occ_anchor_lmos(:)
+		    integer, allocatable :: anchor_atoms(:)
+		    integer, allocatable :: nbr_count(:), nbr_offset(:), nbr_fill(:), nbr_atoms(:)
 #ifdef _OPENMP
-	    type :: diagg1_thread_buffer
-	      integer :: n = 0
-	      integer, allocatable :: i(:), j(:)
-	      double precision, allocatable :: f(:)
+		    type :: diagg1_thread_buffer
+		      integer :: n = 0
+		      integer, allocatable :: i(:), j(:)
+		      double precision, allocatable :: f(:)
 	    end type diagg1_thread_buffer
 	    type(diagg1_thread_buffer), allocatable :: buffers(:)
 	    integer, allocatable :: owner_tid(:), owner_pos(:)
 	    double precision, allocatable :: sumt_thr(:), tiny_thr(:)
 
-	    logical :: use_parallel_diagg1
-	    integer :: nthreads_used, tid, nthreads, est, off, ncopy, pos, ijc_total, start_buf
-	    integer :: max_threads, nij_max
-	    double precision :: sumt_par, tiny_par, sumt_loc, tiny_loc
-	    integer, allocatable :: start_idx(:)
-	    double precision, allocatable :: ws_loc(:), avir_loc(:), aov_loc(:), fstore(:)
-	    logical, allocatable :: latoms_loc(:)
-	    integer, allocatable :: jstore(:)
+		    logical :: use_parallel_diagg1
+		    integer :: nthreads_used, tid, nthreads, est, off, ncopy, ijc_total, start_buf
+		    integer :: max_threads, nij_max
+		    double precision :: sumt_par, tiny_par, sumt_loc, tiny_loc
+		    integer, allocatable :: start_idx(:)
+		    integer :: occ_stamp
+		    logical :: need_ws_resize
+		    double precision, allocatable, save :: ws_ws(:,:), avir_ws(:,:), aov_ws(:,:), fstore_ws(:,:)
+		    double precision, allocatable :: avir_loc(:)
+		    logical, allocatable, save :: latoms_ws(:,:)
+		    integer, allocatable, save :: jstore_ws(:,:), occ_tag_ws(:,:), occ_cand_ws(:,:)
 #endif
 	    integer, external :: ijbo
 	    if (numcal /= icalcn) then
@@ -137,69 +145,194 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
     if (idiagg <= 5) then
       cutoff = cutlim
     end if
-    sumt = 0.d0
-    ijc = 0
-    tiny = 0.d0
+	    sumt = 0.d0
+	    ijc = 0
+	    tiny = 0.d0
 	    !
+	    !  Build sparse occupied-anchor incidence and virtual-anchor neighborhood maps.
+	    !  Eq. (A1):  M(a,j) = 1 if occupied LMO j has anchor atom a (primary or secondary), else 0.
+	    !  Eq. (A2):  N(i) = U_{b in anchors(i)} U_{a in nbr(b)} { j | M(a,j)=1 }.
+	    !  This replaces O(nocc*nvir) anchor pretests by sparse candidate traversal.
 	    !
+	    allocate (occ_anchor1(nocc), occ_anchor2(nocc), occ_anchor_count(numat), &
+	         & occ_anchor_offset(numat+1), occ_anchor_fill(numat))
+	    occ_anchor_count(:) = 0
+	    do j = 1, nocc
+	      occ_anchor1(j) = icocc(nncf(j)+1)
+	      if (ncf(j) > 1) then
+	        occ_anchor2(j) = icocc(nncf(j)+2)
+	      else
+	        occ_anchor2(j) = occ_anchor1(j)
+	      end if
+	      occ_anchor_count(occ_anchor1(j)) = occ_anchor_count(occ_anchor1(j)) + 1
+	      if (occ_anchor2(j) /= occ_anchor1(j)) then
+	        occ_anchor_count(occ_anchor2(j)) = occ_anchor_count(occ_anchor2(j)) + 1
+	      end if
+	    end do
+	    occ_anchor_offset(1) = 1
+	    do j = 1, numat
+	      occ_anchor_offset(j+1) = occ_anchor_offset(j) + occ_anchor_count(j)
+	    end do
+	    occ_anchor_refs = occ_anchor_offset(numat+1) - 1
+	    allocate (occ_anchor_lmos(Max (1, occ_anchor_refs)))
+	    occ_anchor_fill(:) = occ_anchor_offset(1:numat)
+	    do j = 1, nocc
+	      pos = occ_anchor_fill(occ_anchor1(j))
+	      occ_anchor_lmos(pos) = j
+	      occ_anchor_fill(occ_anchor1(j)) = pos + 1
+	      if (occ_anchor2(j) /= occ_anchor1(j)) then
+	        pos = occ_anchor_fill(occ_anchor2(j))
+	        occ_anchor_lmos(pos) = j
+	        occ_anchor_fill(occ_anchor2(j)) = pos + 1
+	      end if
+	    end do
+	    deallocate (occ_anchor_fill)
+	
+	    n_anchor_atoms = Count (occ_anchor_count(1:numat) > 0)
+	    allocate (anchor_atoms(Max (1, n_anchor_atoms)))
+	    if (n_anchor_atoms > 0) then
+	      aidx = 0
+	      do j = 1, numat
+	        if (occ_anchor_count(j) > 0) then
+	          aidx = aidx + 1
+	          anchor_atoms(aidx) = j
+	        end if
+	      end do
+	    end if
+	
+	    allocate (nbr_count(numat), nbr_offset(numat+1), nbr_fill(numat))
+	    nbr_count(:) = 0
+	    do src_atom = 1, numat
+	      if (occ_anchor_count(src_atom) > 0) nbr_count(src_atom) = 1
+	      do aidx = 1, n_anchor_atoms
+	        dst_atom = anchor_atoms(aidx)
+	        if (dst_atom == src_atom) cycle
+	        if (lijbo) then
+	          if (nijbo(dst_atom, src_atom) >= 0) nbr_count(src_atom) = nbr_count(src_atom) + 1
+	        else
+	          if (ijbo(src_atom, dst_atom) >= 0) nbr_count(src_atom) = nbr_count(src_atom) + 1
+	        end if
+	      end do
+	    end do
+	    nbr_offset(1) = 1
+	    do j = 1, numat
+	      nbr_offset(j+1) = nbr_offset(j) + nbr_count(j)
+	    end do
+	    n_neighbor_refs = nbr_offset(numat+1) - 1
+	    allocate (nbr_atoms(Max (1, n_neighbor_refs)))
+	    nbr_fill(:) = nbr_offset(1:numat)
+	    do src_atom = 1, numat
+	      if (occ_anchor_count(src_atom) > 0) then
+	        pos = nbr_fill(src_atom)
+	        nbr_atoms(pos) = src_atom
+	        nbr_fill(src_atom) = pos + 1
+	      end if
+	      do aidx = 1, n_anchor_atoms
+	        dst_atom = anchor_atoms(aidx)
+	        if (dst_atom == src_atom) cycle
+	        if (lijbo) then
+	          if (nijbo(dst_atom, src_atom) < 0) cycle
+	        else
+	          if (ijbo(src_atom, dst_atom) < 0) cycle
+	        end if
+	        pos = nbr_fill(src_atom)
+	        nbr_atoms(pos) = dst_atom
+	        nbr_fill(src_atom) = pos + 1
+	      end do
+	    end do
+	    deallocate (nbr_fill)
+		    !
+		    !
 #ifdef _OPENMP
-	    use_parallel_diagg1 = .false.
-	    max_threads = omp_get_max_threads()
-	    use_parallel_diagg1 = (max_threads > 1 .and. nvir > 8)
-	    if (use_parallel_diagg1) then
-	      nij_max = nij
-	      ijc = 0
-	      sumt = 0.d0
-	      tiny = 0.d0
-		      if (idiagg <= 5 .or. Mod (idiagg, 2) == 0) then
-		        nfmo(1:nvir) = 0
-		        allocate (buffers(max_threads), owner_tid(nvir), owner_pos(nvir), &
-		             & sumt_thr(max_threads), tiny_thr(max_threads), start_idx(nvir))
-		        owner_tid(:) = 0
-		        owner_pos(:) = 0
-		        sumt_thr(:) = 0.d0
-		        tiny_thr(:) = 0.d0
-		        nthreads_used = 1
-!$omp parallel default(shared) private(ws_loc, latoms_loc, avir_loc, aov_loc, jstore, fstore, sumt_loc, tiny_loc, &
-!$omp& sumt_par, tiny_par, l, tid, nthreads, est, i, prev_i, start_buf)
-			        tid = omp_get_thread_num() + 1
-			        nthreads = omp_get_num_threads()
+		    use_parallel_diagg1 = .false.
+		    max_threads = omp_get_max_threads()
+		    use_parallel_diagg1 = (max_threads > 1 .and. nvir > 8)
+		    if (use_parallel_diagg1) then
+		      nij_max = nij
+		      ijc = 0
+		      sumt = 0.d0
+		      tiny = 0.d0
+		      need_ws_resize = .true.
+		      if (allocated(ws_ws) .and. allocated(latoms_ws) .and. allocated(avir_ws) .and. &
+		         & allocated(aov_ws) .and. allocated(jstore_ws) .and. allocated(fstore_ws) .and. &
+		         & allocated(occ_tag_ws) .and. allocated(occ_cand_ws)) then
+		        if (size(ws_ws,1) >= norbs .and. size(ws_ws,2) >= max_threads .and. &
+		           & size(latoms_ws,1) >= numat .and. size(latoms_ws,2) >= max_threads .and. &
+		           & size(avir_ws,1) >= numat .and. size(avir_ws,2) >= max_threads .and. &
+		           & size(aov_ws,1) >= numat .and. size(aov_ws,2) >= max_threads .and. &
+		           & size(jstore_ws,1) >= nocc .and. size(jstore_ws,2) >= max_threads .and. &
+		           & size(fstore_ws,1) >= nocc .and. size(fstore_ws,2) >= max_threads .and. &
+		           & size(occ_tag_ws,1) >= nocc .and. size(occ_tag_ws,2) >= max_threads .and. &
+		           & size(occ_cand_ws,1) >= nocc .and. size(occ_cand_ws,2) >= max_threads) then
+		          need_ws_resize = .false.
+		        end if
+		      end if
+		      if (need_ws_resize) then
+		        if (allocated(ws_ws)) deallocate (ws_ws)
+		        if (allocated(latoms_ws)) deallocate (latoms_ws)
+		        if (allocated(avir_ws)) deallocate (avir_ws)
+		        if (allocated(aov_ws)) deallocate (aov_ws)
+		        if (allocated(jstore_ws)) deallocate (jstore_ws)
+		        if (allocated(fstore_ws)) deallocate (fstore_ws)
+		        if (allocated(occ_tag_ws)) deallocate (occ_tag_ws)
+		        if (allocated(occ_cand_ws)) deallocate (occ_cand_ws)
+		        !
+		        ! Eq. (B1): workspace footprint = O((norbs + 3*numat + 4*nocc) * threads)
+		        ! Persistent scratch removes allocator contention in hot OpenMP regions.
+		        !
+		        allocate (ws_ws(norbs, max_threads), latoms_ws(numat, max_threads), &
+		             & avir_ws(numat, max_threads), aov_ws(numat, max_threads), &
+		             & jstore_ws(nocc, max_threads), fstore_ws(nocc, max_threads), &
+		             & occ_tag_ws(nocc, max_threads), occ_cand_ws(nocc, max_threads))
+		      end if
+		      occ_tag_ws(:,1:max_threads) = 0
+			      if (idiagg <= 5 .or. Mod (idiagg, 2) == 0) then
+			        nfmo(1:nvir) = 0
+			        allocate (buffers(max_threads), owner_tid(nvir), owner_pos(nvir), &
+			             & sumt_thr(max_threads), tiny_thr(max_threads), start_idx(nvir))
+			        owner_tid(:) = 0
+			        owner_pos(:) = 0
+			        sumt_thr(:) = 0.d0
+			        tiny_thr(:) = 0.d0
+			        nthreads_used = 1
+!$omp parallel default(shared) private(sumt_loc, tiny_loc, sumt_par, tiny_par, l, tid, nthreads, est, i, &
+!$omp& prev_i, start_buf, occ_stamp)
+				        tid = omp_get_thread_num() + 1
+				        nthreads = omp_get_num_threads()
 !$omp single
-			        nthreads_used = nthreads
+				        nthreads_used = nthreads
 !$omp end single
-			        est = Max (1024, (nij_max + nthreads - 1) / Max (1, nthreads))
-			        call buffer_reserve (buffers(tid), est)
-
-			        allocate (ws_loc(norbs), latoms_loc(numat), avir_loc(numat), aov_loc(numat), &
-			             & jstore(nocc), fstore(nocc))
-			        sumt_loc = 0.d0
-			        tiny_loc = 0.d0
-			        prev_i = 0
+				        est = Max (1024, (nij_max + nthreads - 1) / Max (1, nthreads))
+				        call buffer_reserve (buffers(tid), est)
+				        sumt_loc = 0.d0
+				        tiny_loc = 0.d0
+				        prev_i = 0
+				        occ_stamp = 0
 
 !$omp do schedule(dynamic,1)
-				        ! Irregular-work balancing: each virtual i has variable cost W_i,
-				        ! so dynamic scheduling approximates minimizing max_t(sum_{i in t} W_i).
-				        do i = 1, nvir
-			          call build_virtual (i, prev_i, ws_loc, latoms_loc, avir_loc, aov_loc, cutoff)
-			          prev_i = i
-			          call rebuild_couplings (i, ws_loc, latoms_loc, aov_loc, cutoff, flim, oldlim, jstore, fstore, &
-			               & sumt_par, tiny_par, l)
-			          nfmo(i) = l
-			          sumt_loc = sumt_loc + sumt_par
-		          tiny_loc = Max (tiny_loc, tiny_par)
-		          if (l > 0) then
-		            start_buf = buffers(tid)%n + 1
-		            call buffer_append (buffers(tid), i, jstore, fstore, l)
-		            owner_tid(i) = tid
-		            owner_pos(i) = start_buf
-		          end if
-			        end do
+					        ! Irregular-work balancing: each virtual i has variable cost W_i,
+					        ! so dynamic scheduling approximates minimizing max_t(sum_{i in t} W_i).
+					        do i = 1, nvir
+				          call build_virtual (i, prev_i, ws_ws(:,tid), latoms_ws(:,tid), avir_ws(:,tid), &
+				               & aov_ws(:,tid), cutoff)
+				          prev_i = i
+				          call rebuild_couplings (i, ws_ws(:,tid), latoms_ws(:,tid), aov_ws(:,tid), &
+				               & cutoff, flim, oldlim, jstore_ws(:,tid), fstore_ws(:,tid), &
+				               & occ_tag_ws(:,tid), occ_stamp, occ_cand_ws(:,tid), sumt_par, tiny_par, l)
+				          nfmo(i) = l
+				          sumt_loc = sumt_loc + sumt_par
+			          tiny_loc = Max (tiny_loc, tiny_par)
+			          if (l > 0) then
+			            start_buf = buffers(tid)%n + 1
+			            call buffer_append (buffers(tid), i, jstore_ws(:,tid), fstore_ws(:,tid), l)
+			            owner_tid(i) = tid
+			            owner_pos(i) = start_buf
+			          end if
+				        end do
 !$omp end do
 
-		        sumt_thr(tid) = sumt_loc
-		        tiny_thr(tid) = tiny_loc
-
-		        deallocate (ws_loc, latoms_loc, avir_loc, aov_loc, jstore, fstore)
+			        sumt_thr(tid) = sumt_loc
+			        tiny_thr(tid) = tiny_loc
 !$omp end parallel
 
 		        sumt = 0.d0
@@ -271,44 +404,44 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
 		        end do
 		        ijc = start_idx(nvir) + nfmo(nvir) - 1
 		        ijc = Min (ijc, nij_max)
-		        sumt_par = 0.d0
-		        tiny_par = 0.d0
-!$omp parallel default(shared) private(ws_loc, latoms_loc, avir_loc, aov_loc, l, sum, loopj, kl, jj, j, k, kk, k1, prev_i) &
+			        sumt_par = 0.d0
+			        tiny_par = 0.d0
+!$omp parallel default(shared) private(l, sum, loopj, kl, jj, j, k, kk, k1, prev_i, tid) &
 !$omp& reduction(+:sumt_par) reduction(max:tiny_par)
-		        allocate (ws_loc(norbs), latoms_loc(numat), avir_loc(numat), aov_loc(numat))
-		        prev_i = 0
+			        tid = omp_get_thread_num() + 1
+			        prev_i = 0
 !$omp do schedule(dynamic,1)
-		        do i = 1, nvir
-		          call build_virtual (i, prev_i, ws_loc, latoms_loc, avir_loc, aov_loc, cutoff)
-		          prev_i = i
-		          l = nfmo(i)
-		          if (l <= 0) cycle
-			          do jj = 1, l
-			            if (start_idx(i)+jj-1 > nij_max) exit
-		            j = ifmo(2, start_idx(i)+jj-1)
-		            loopj = ncocc(j)
-			            sum = 0.d0
-			            kl = 0
-			            do kk = nncf(j) + 1, nncf(j) + ncf(j)
-			              k1 = icocc(kk)
-		              if (.not. latoms_loc(k1)) then
-		                kl = kl + iorbs(k1)
-		              else if (aov_loc(k1)*aocc(kk) < cutoff) then
-		                kl = kl + iorbs(k1)
-		              else
-		                do k = nfirst(k1), nlast(k1)
-		                  kl = kl + 1
-	                  sum = sum + ws_loc(k) * cocc(kl+loopj)
-	                end do
-	              end if
-	            end do
-		            sumt_par = sumt_par + Abs (sum)
-		            tiny_par = Max (tiny_par, Abs (sum))
-		            fmo(start_idx(i)+jj-1) = sum
-		          end do
-		        end do
+			        do i = 1, nvir
+			          call build_virtual (i, prev_i, ws_ws(:,tid), latoms_ws(:,tid), avir_ws(:,tid), &
+			               & aov_ws(:,tid), cutoff)
+			          prev_i = i
+			          l = nfmo(i)
+			          if (l <= 0) cycle
+				          do jj = 1, l
+				            if (start_idx(i)+jj-1 > nij_max) exit
+			            j = ifmo(2, start_idx(i)+jj-1)
+			            loopj = ncocc(j)
+				            sum = 0.d0
+				            kl = 0
+				            do kk = nncf(j) + 1, nncf(j) + ncf(j)
+				              k1 = icocc(kk)
+			              if (.not. latoms_ws(k1, tid)) then
+			                kl = kl + iorbs(k1)
+			              else if (aov_ws(k1, tid)*aocc(kk) < cutoff) then
+			                kl = kl + iorbs(k1)
+			              else
+			                do k = nfirst(k1), nlast(k1)
+			                  kl = kl + 1
+		                  sum = sum + ws_ws(k, tid) * cocc(kl+loopj)
+		                end do
+		              end if
+		            end do
+			            sumt_par = sumt_par + Abs (sum)
+			            tiny_par = Max (tiny_par, Abs (sum))
+			            fmo(start_idx(i)+jj-1) = sum
+			          end do
+			        end do
 !$omp end do
-		        deallocate (ws_loc, latoms_loc, avir_loc, aov_loc)
 !$omp end parallel
 	        sumt = sumt_par
 	        tiny = tiny_par
@@ -699,13 +832,22 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
 #endif
 	      oldlim = tiny * safety * 1.d-3
 	      fref = tiny ** 4
-	      if (times) then
-	        call timer (" AFTER DIAGG1 IN ITER")
-	      end if
-	    end if
+		      if (times) then
+		        call timer (" AFTER DIAGG1 IN ITER")
+		      end if
+		    end if
+		    if (allocated(occ_anchor1)) deallocate (occ_anchor1)
+		    if (allocated(occ_anchor2)) deallocate (occ_anchor2)
+		    if (allocated(occ_anchor_count)) deallocate (occ_anchor_count)
+		    if (allocated(occ_anchor_offset)) deallocate (occ_anchor_offset)
+		    if (allocated(occ_anchor_lmos)) deallocate (occ_anchor_lmos)
+		    if (allocated(anchor_atoms)) deallocate (anchor_atoms)
+		    if (allocated(nbr_count)) deallocate (nbr_count)
+		    if (allocated(nbr_offset)) deallocate (nbr_offset)
+		    if (allocated(nbr_atoms)) deallocate (nbr_atoms)
 
-		    ovmax = tiny
-		  contains
+			    ovmax = tiny
+			  contains
 #ifdef _OPENMP
 		  subroutine buffer_reserve (buf, cap)
 		    type(diagg1_thread_buffer), intent (inout) :: buf
@@ -1031,7 +1173,8 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
 		    eigs(i) = sum
 		  end subroutine build_occupied_energy
 	
-		  subroutine rebuild_couplings (i, ws, latoms, aov, cutoff, flim, oldlim, jstore, fstore, sumt_i, tiny_i, nf)
+		  subroutine rebuild_couplings (i, ws, latoms, aov, cutoff, flim, oldlim, jstore, fstore, &
+		       & occ_tag, occ_stamp, occ_cand, sumt_i, tiny_i, nf)
 		    integer, intent (in) :: i
 		    double precision, dimension (norbs), intent (in) :: ws
 	    logical, dimension (numat), intent (in) :: latoms
@@ -1039,11 +1182,14 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
 	    double precision, intent (in) :: cutoff, flim, oldlim
 	    integer, dimension (nocc), intent (out) :: jstore
 	    double precision, dimension (nocc), intent (out) :: fstore
+	    integer, dimension (nocc), intent (inout) :: occ_tag
+	    integer, dimension (nocc), intent (inout) :: occ_cand
+	    integer, intent (inout) :: occ_stamp
 	    double precision, intent (out) :: sumt_i, tiny_i
 	    integer, intent (out) :: nf
 
 	    integer :: i1, i2, i1j1, i1j2, i2j1, i2j2
-	    integer :: j, j1, j2, k, k1, kk, kl, loopj
+	    integer :: j, j1, j2, k, k1, kk, kl, loopj, ncand, idx
 	    double precision :: sum
 	    logical :: lij
 
@@ -1057,9 +1203,27 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
 	    else
 	      i2 = i1
 	    end if
+	    !
+	    ! Eq. (C1): candidate occupied set
+	    ! N(i) = U_{b in {i1,i2}} U_{a in nbr(b)} { j | M(a,j)=1 }.
+	    ! Deterministic insertion sort keeps virtual-major + occupied-ascending traversal.
+	    !
+	    if (occ_stamp == Huge(occ_stamp)) then
+	      occ_tag(:) = 0
+	      occ_stamp = 1
+	    else
+	      occ_stamp = occ_stamp + 1
+	    end if
+	    ncand = 0
+	    call gather_occ_candidates (i1, occ_stamp, occ_tag, occ_cand, ncand)
+	    if (i2 /= i1) then
+	      call gather_occ_candidates (i2, occ_stamp, occ_tag, occ_cand, ncand)
+	    end if
+	    if (ncand > 1) call sort_occ_candidates (occ_cand, ncand)
 
 	    if (lijbo) then
-	      do j = 1, nocc
+	      do idx = 1, ncand
+	        j = occ_cand(idx)
 	        j1 = icocc(nncf(j)+1)
 	        if (ncf(j) > 1) then
 	          j2 = icocc(nncf(j)+2)
@@ -1113,7 +1277,8 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
 	        end if
 	      end do
 	    else
-	      do j = 1, nocc
+	      do idx = 1, ncand
+	        j = occ_cand(idx)
 	        j1 = icocc(nncf(j)+1)
 	        if (ncf(j) > 1) then
 	          j2 = icocc(nncf(j)+2)
@@ -1167,4 +1332,37 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
 	      end do
 		    end if
 		  end subroutine rebuild_couplings
+
+		  subroutine gather_occ_candidates (anchor_atom, tag_value, occ_tag, occ_cand, ncand)
+		    integer, intent (in) :: anchor_atom, tag_value
+		    integer, dimension (nocc), intent (inout) :: occ_tag, occ_cand
+		    integer, intent (inout) :: ncand
+		    integer :: nbr_pos, occ_pos, occ_atom, j
+		    do nbr_pos = nbr_offset(anchor_atom), nbr_offset(anchor_atom+1) - 1
+		      occ_atom = nbr_atoms(nbr_pos)
+		      do occ_pos = occ_anchor_offset(occ_atom), occ_anchor_offset(occ_atom+1) - 1
+		        j = occ_anchor_lmos(occ_pos)
+		        if (occ_tag(j) /= tag_value) then
+		          occ_tag(j) = tag_value
+		          ncand = ncand + 1
+		          occ_cand(ncand) = j
+		        end if
+		      end do
+		    end do
+		  end subroutine gather_occ_candidates
+
+		  subroutine sort_occ_candidates (occ_cand, ncand)
+		    integer, dimension (nocc), intent (inout) :: occ_cand
+		    integer, intent (in) :: ncand
+		    integer :: idx, key, pos
+		    do idx = 2, ncand
+		      key = occ_cand(idx)
+		      pos = idx - 1
+		      do while (pos >= 1 .and. occ_cand(pos) > key)
+		        occ_cand(pos+1) = occ_cand(pos)
+		        pos = pos - 1
+		      end do
+		      occ_cand(pos+1) = key
+		    end do
+		  end subroutine sort_occ_candidates
 		end subroutine diagg1

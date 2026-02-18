@@ -1,0 +1,6 @@
+wall_delta_s=-0.1986670000
+diagg1_delta_s=-0.1500000000
+diagg2_delta_s=-0.0580000000
+density_delta_s=0.0246670000
+buildf_delta_s=-0.3700000000
+hof_delta_kjmol=0.0000000000

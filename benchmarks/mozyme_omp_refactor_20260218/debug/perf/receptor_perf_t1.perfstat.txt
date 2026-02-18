@@ -1,0 +1,27 @@
+# started on Wed Feb 18 22:32:58 2026
+
+
+ Performance counter stats for 'env OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 build-perf-fresh-20260218_221709/mopac benchmarks/mozyme_omp_refactor_20260218/debug/perf/receptor_perf_t1.mop':
+
+       57187993706      task-clock                       #    1.000 CPUs utilized             
+      256666212341      cpu_atom/cycles/                 #    4.488 GHz                         (0.05%)
+      293417860228      cpu_core/cycles/                 #    5.131 GHz                         (99.95%)
+     <not counted>      cpu_lowpower/cycles/                                                    (0.00%)
+      806712453848      cpu_atom/instructions/           #    3.14  insn per cycle              (0.05%)
+      745369634046      cpu_core/instructions/           #    2.54  insn per cycle              (99.95%)
+     <not counted>      cpu_lowpower/instructions/                                              (0.00%)
+        2004128318      cpu_atom/cache-references/       #   35.045 M/sec                       (0.05%)
+        4428946222      cpu_core/cache-references/       #   77.445 M/sec                       (99.95%)
+     <not counted>      cpu_lowpower/cache-references/                                          (0.00%)
+        1631354966      cpu_atom/cache-misses/           #   81.40% of all cache refs           (0.05%)
+         970285502      cpu_core/cache-misses/           #   21.91% of all cache refs           (99.95%)
+     <not counted>      cpu_lowpower/cache-misses/                                              (0.00%)
+               505      context-switches                 #    8.831 /sec                      
+                 1      cpu-migrations                   #    0.017 /sec                      
+
+      57.197635032 seconds time elapsed
+
+      57.094021000 seconds user
+       0.092983000 seconds sys
+
+
