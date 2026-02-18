@@ -32,7 +32,7 @@
     use parameters_C, only: main_group
     use chanel_C, only: iw
 #ifdef _OPENMP
-    use omp_lib, only: omp_get_max_threads
+    use omp_lib, only: omp_get_max_threads, omp_get_thread_num, omp_get_wtime
 #endif
     implicit none
     integer, intent (in) :: idiagg, nij, nocc, nvir
@@ -47,21 +47,38 @@
     integer :: i, ii, jur, l
     integer, save :: icalcn = 0
     integer :: ij, ilr, incv, iur, j, jlr, jncf, k, le, lf, lij, loopi, loopj, &
-   & mie, mle, mlee, mlf, mlff, ncei, ncfj, nrej
+   & mie, mle, mlee, mlf, mlff, ncei, ncfj, nrej, njlen, nilen
     double precision :: a, alpha, b, beta, biglim, c, d, e, sum
     double precision, save :: const, eps, eta, bigeps
     double precision, external :: reada
     integer, dimension (2) :: nrejct
     data nrejct / 2 * 0 /
 #ifdef _OPENMP
-    integer :: alloc_stat, max_threads
+    integer, parameter :: mode_level = 1, mode_task = 2
+    double precision, parameter :: tune_alpha = 0.25d0, tune_switch_margin = 1.02d0
+    integer, parameter :: tune_explore_period = 24
+    integer :: alloc_stat, max_threads, tid, diagg2_threads, width_hint
     integer :: lvl, max_level, nactive, pos
+    integer :: batch_start, batch_end, batch_target, batch_edges
+    integer :: batch_min, batch_max
+    integer :: i_task, j_task
+    integer :: mode_selected, mode_used, tune_slot
+    integer :: tune_calls_slot
+    logical :: task_capable, force_explore
+    double precision :: t_start, elapsed, edge_cost
     integer, allocatable :: edge_level(:), last_occ(:), last_vir(:)
     integer, allocatable :: level_count(:), level_offset(:), level_pos(:), level_edges(:)
-    integer, allocatable :: iused_t(:)
-    logical, allocatable :: latoms_t(:)
-    double precision, allocatable :: storei_t(:), storej_t(:)
+    integer, allocatable, save :: iused_ws(:,:)
+    logical, allocatable, save :: latoms_ws(:,:)
+    double precision, allocatable, save :: storei_ws(:,:), storej_ws(:,:)
+    double precision, allocatable :: sumb_thread(:)
+    integer, allocatable :: nrej_thread(:)
+    integer, save :: ws_numat = 0, ws_norbs = 0, ws_nthreads = 0
+    logical :: need_ws_resize
     logical :: active
+    integer, allocatable, save :: tune_calls(:), tune_task_samples(:), tune_level_samples(:)
+    integer, allocatable, save :: tune_batch(:), tune_batch_step(:), tune_batch_dir(:)
+    double precision, allocatable, save :: tune_task_cost(:), tune_level_cost(:), tune_prev_task_cost(:)
     double precision :: sumb_local
     integer :: nrej_local
 #endif
@@ -230,49 +247,249 @@
             end do
 
             level_pos(:) = level_offset(1:max_level)
-            do ij = 1, nij
-              lvl = edge_level(ij)
-              if (lvl > 0) then
-                pos = level_pos(lvl)
-                level_edges(pos) = ij
-                level_pos(lvl) = pos + 1
-              end if
-            end do
+	            do ij = 1, nij
+	              lvl = edge_level(ij)
+	              if (lvl > 0) then
+	                pos = level_pos(lvl)
+	                level_edges(pos) = ij
+	                level_pos(lvl) = pos + 1
+	              end if
+	            end do
 
-            sumb_local = 0.d0
-            nrej_local = 0
-!$omp parallel default(shared) &
-!$omp& private(ij, lvl, pos, alloc_stat, iused_t, latoms_t, storei_t, storej_t) &
-!$omp& reduction(+:sumb_local, nrej_local)
-            allocate (iused_t(numat), latoms_t(numat), storei_t(norbs), storej_t(norbs), stat=alloc_stat)
-            if (alloc_stat /= 0) then
-!$omp critical(diagg2_alloc_fail)
-              call mopend("Insufficient memory to run DIAGG2 (parallel scratch)")
-!$omp end critical(diagg2_alloc_fail)
-            else
-              iused_t(:) = -1
-              latoms_t(:) = .false.
+	            ! Previous-commit improvement kept here: adaptive team sizing from level width.
+	            ! Eq. (0): width_hint = ceil(nactive / max_level)
+	            !         diagg2_threads = min(max_threads, 2*width_hint, nactive)
+	            width_hint = Max (1, (nactive + max_level - 1) / max_level)
+	            diagg2_threads = Min (max_threads, Max (1, 2 * width_hint))
+	            diagg2_threads = Min (diagg2_threads, nactive)
 
-              do lvl = 1, max_level
-!$omp do schedule(static)
-                do pos = level_offset(lvl), level_offset(lvl+1) - 1
-                  ij = level_edges(pos)
-                  call process_pair (ij, retry, tiny, biglim, sumb_local, nrej_local, &
-                       & iused_t, latoms_t, storei_t, storej_t)
-                end do
-!$omp end do
-              end do
+	            if (diagg2_threads > 1) then
+	              need_ws_resize = .true.
+	              ! Previous-commit improvement kept here: persistent per-thread scratch reuse.
+	              ! Allocation is skipped when dimensions already satisfy:
+	              !   ws_rows >= required_rows and ws_cols >= diagg2_threads
+	              if (allocated(iused_ws) .and. allocated(latoms_ws) .and. allocated(storei_ws) .and. allocated(storej_ws)) then
+	                if (size(iused_ws,1) >= numat .and. size(iused_ws,2) >= diagg2_threads .and. &
+	                   & size(latoms_ws,1) >= numat .and. size(latoms_ws,2) >= diagg2_threads .and. &
+	                   & size(storei_ws,1) >= norbs .and. size(storei_ws,2) >= diagg2_threads .and. &
+	                   & size(storej_ws,1) >= norbs .and. size(storej_ws,2) >= diagg2_threads) then
+	                  need_ws_resize = .false.
+	                end if
+	              end if
 
-              deallocate (iused_t, latoms_t, storei_t, storej_t)
-            end if
+	              if (need_ws_resize) then
+	                if (allocated(iused_ws)) deallocate (iused_ws)
+	                if (allocated(latoms_ws)) deallocate (latoms_ws)
+	                if (allocated(storei_ws)) deallocate (storei_ws)
+	                if (allocated(storej_ws)) deallocate (storej_ws)
+
+	                ! Scratch footprint scales as O((numat + norbs)*threads), allocated once and reused.
+	                allocate (iused_ws(numat, diagg2_threads), latoms_ws(numat, diagg2_threads), &
+	                     & storei_ws(norbs, diagg2_threads), storej_ws(norbs, diagg2_threads), stat=alloc_stat)
+	                if (alloc_stat /= 0) then
+	                  call mopend("Insufficient memory to run DIAGG2 (parallel scratch workspace)")
+	                end if
+	                ws_numat = numat
+	                ws_norbs = norbs
+	                ws_nthreads = diagg2_threads
+	              end if
+
+	              if (.not. allocated(tune_calls) .or. size(tune_calls) < max_threads) then
+	                if (allocated(tune_calls)) deallocate (tune_calls)
+	                if (allocated(tune_task_samples)) deallocate (tune_task_samples)
+	                if (allocated(tune_level_samples)) deallocate (tune_level_samples)
+	                if (allocated(tune_batch)) deallocate (tune_batch)
+	                if (allocated(tune_batch_step)) deallocate (tune_batch_step)
+	                if (allocated(tune_batch_dir)) deallocate (tune_batch_dir)
+	                if (allocated(tune_task_cost)) deallocate (tune_task_cost)
+	                if (allocated(tune_level_cost)) deallocate (tune_level_cost)
+	                if (allocated(tune_prev_task_cost)) deallocate (tune_prev_task_cost)
+
+	                allocate (tune_calls(max_threads), tune_task_samples(max_threads), tune_level_samples(max_threads), &
+	                     & tune_batch(max_threads), tune_batch_step(max_threads), tune_batch_dir(max_threads), &
+	                     & tune_task_cost(max_threads), tune_level_cost(max_threads), tune_prev_task_cost(max_threads), &
+	                     & stat=alloc_stat)
+	                if (alloc_stat /= 0) then
+	                  call mopend("Insufficient memory to run DIAGG2 (autotuner workspace)")
+	                end if
+	                tune_calls(:) = 0
+	                tune_task_samples(:) = 0
+	                tune_level_samples(:) = 0
+	                tune_batch(:) = 0
+	                tune_batch_step(:) = 0
+	                tune_batch_dir(:) = 1
+	                tune_task_cost(:) = 0.d0
+	                tune_level_cost(:) = 0.d0
+	                tune_prev_task_cost(:) = 0.d0
+	              end if
+
+	              tune_slot = diagg2_threads
+	              if (tune_batch(tune_slot) <= 0) then
+	                tune_batch(tune_slot) = Max (64, 8*diagg2_threads)
+	              end if
+	              if (tune_batch_step(tune_slot) <= 0) then
+	                tune_batch_step(tune_slot) = Max (16, tune_batch(tune_slot)/4)
+	              end if
+	              if (tune_batch_dir(tune_slot) == 0) then
+	                tune_batch_dir(tune_slot) = 1
+	              end if
+
+	              tune_calls(tune_slot) = tune_calls(tune_slot) + 1
+	              tune_calls_slot = tune_calls(tune_slot)
+	              task_capable = (max_level > 1 .and. nactive >= 2*diagg2_threads)
+	              mode_selected = mode_level
+
+	              if (task_capable) then
+	                if (tune_level_samples(tune_slot) == 0) then
+	                  mode_selected = mode_level
+	                else if (tune_task_samples(tune_slot) == 0) then
+	                  mode_selected = mode_task
+	                else
+	                  force_explore = (tune_task_samples(tune_slot) >= 3 .and. tune_level_samples(tune_slot) >= 3 .and. &
+	                       & Mod(tune_calls_slot, tune_explore_period) == 0)
+	                  if (force_explore) then
+	                    if (tune_task_cost(tune_slot) <= tune_level_cost(tune_slot)) then
+	                      mode_selected = mode_level
+	                    else
+	                      mode_selected = mode_task
+	                    end if
+	                  else
+	                    ! Eq. (4) Exploit faster mode with hysteresis:
+	                    ! choose task mode when c_task <= m * c_level, m = tune_switch_margin.
+	                    if (tune_task_cost(tune_slot) <= tune_switch_margin*tune_level_cost(tune_slot)) then
+	                      mode_selected = mode_task
+	                    else
+	                      mode_selected = mode_level
+	                    end if
+	                  end if
+	                end if
+	              end if
+
+	              mode_used = mode_selected
+	              if (mode_selected == mode_task) then
+	                allocate (sumb_thread(diagg2_threads), nrej_thread(diagg2_threads), stat=alloc_stat)
+	                if (alloc_stat /= 0) then
+	                  ! Robust fallback to level mode if temporary task accumulators cannot be allocated.
+	                  mode_used = mode_level
+	                end if
+	              else
+	                mode_used = mode_level
+	              end if
+
+	              if (mode_used == mode_task) then
+	                sumb_thread(:) = 0.d0
+	                nrej_thread(:) = 0
+	                batch_min = Max (32, 4*diagg2_threads)
+	                batch_max = Max (batch_min, Min (nactive, 8192))
+	                batch_target = Min (batch_max, Max (batch_min, tune_batch(tune_slot)))
+
+	                t_start = omp_get_wtime()
+!$omp parallel num_threads(diagg2_threads) default(shared) private(ij, lvl, pos, tid, i_task, j_task, batch_start, batch_end, batch_edges)
+	                tid = omp_get_thread_num() + 1
+	                iused_ws(:, tid) = -1
+	                latoms_ws(:, tid) = .false.
+!$omp single
+	                batch_start = 1
+	                do while (batch_start <= max_level)
+	                  batch_end = batch_start
+	                  batch_edges = 0
+	                  do while (batch_end <= max_level .and. batch_edges < batch_target)
+	                    batch_edges = batch_edges + level_count(batch_end)
+	                    batch_end = batch_end + 1
+	                  end do
+	                  batch_end = Max (batch_start, batch_end - 1)
+	                  do lvl = batch_start, batch_end
+	                    do pos = level_offset(lvl), level_offset(lvl+1) - 1
+	                      ij = level_edges(pos)
+	                      i_task = ifmo(1, ij)
+	                      j_task = ifmo(2, ij)
+	                      ! Two tasks are independent iff they do not share indices:
+	                      !   (i1 /= i2) AND (j1 /= j2)
+	                      ! Dependence tokens (last_vir(i), last_occ(j)) enforce this relation.
+!$omp task default(shared) firstprivate(ij, i_task, j_task) private(tid) &
+!$omp& depend(inout:last_occ(j_task), last_vir(i_task))
+	                      tid = omp_get_thread_num() + 1
+	                      call process_pair (ij, retry, tiny, biglim, sumb_thread(tid), nrej_thread(tid), &
+	                           & iused_ws(:,tid), latoms_ws(:,tid), storei_ws(:,tid), storej_ws(:,tid))
+!$omp end task
+	                    end do
+	                  end do
+!$omp taskwait
+	                  batch_start = batch_end + 1
+	                end do
+!$omp end single
 !$omp end parallel
+	                elapsed = Max (1.d-12, omp_get_wtime() - t_start)
+	                ! Eq. (1) Normalized cost per active pair: c = elapsed / nactive
+	                edge_cost = elapsed / Dble (Max (1, nactive))
+	                if (tune_task_samples(tune_slot) == 0) then
+	                  tune_task_cost(tune_slot) = edge_cost
+	                else
+	                  ! Eq. (2) EWMA update: c_new = (1-alpha)*c_old + alpha*c_obs
+	                  tune_task_cost(tune_slot) = (1.d0-tune_alpha)*tune_task_cost(tune_slot) + tune_alpha*edge_cost
+	                end if
+	                tune_task_samples(tune_slot) = tune_task_samples(tune_slot) + 1
 
-            sumb = sumb_local
-            nrej = nrej_local
+	                if (tune_prev_task_cost(tune_slot) > 0.d0) then
+	                  ! If no improvement (c_k >= 0.99*c_{k-1}), reverse search direction and shrink step.
+	                  if (edge_cost >= 0.99d0*tune_prev_task_cost(tune_slot)) then
+	                    tune_batch_dir(tune_slot) = -tune_batch_dir(tune_slot)
+	                    tune_batch_step(tune_slot) = Max (16, tune_batch_step(tune_slot)/2)
+	                  end if
+	                end if
+	                tune_prev_task_cost(tune_slot) = edge_cost
+	                ! Eq. (3) Batch walk: b_{k+1} = clamp(b_k + dir*step, b_min, b_max)
+	                tune_batch(tune_slot) = batch_target + tune_batch_dir(tune_slot)*tune_batch_step(tune_slot)
+	                tune_batch(tune_slot) = Min (batch_max, Max (batch_min, tune_batch(tune_slot)))
 
-            deallocate (level_edges, level_pos, level_offset, level_count)
-          end if
-        end if
+	                sumb = 0.d0
+	                nrej = 0
+	                do tid = 1, diagg2_threads
+	                  sumb = sumb + sumb_thread(tid)
+	                  nrej = nrej + nrej_thread(tid)
+	                end do
+	                deallocate (sumb_thread, nrej_thread)
+	              else
+	                sumb_local = 0.d0
+	                nrej_local = 0
+	                t_start = omp_get_wtime()
+!$omp parallel num_threads(diagg2_threads) default(shared) private(ij, lvl, pos, tid) &
+!$omp& reduction(+:sumb_local, nrej_local)
+	                tid = omp_get_thread_num() + 1
+	                iused_ws(:, tid) = -1
+	                latoms_ws(:, tid) = .false.
+
+	                do lvl = 1, max_level
+!$omp do schedule(dynamic,16)
+	                  do pos = level_offset(lvl), level_offset(lvl+1) - 1
+	                    ij = level_edges(pos)
+	                    call process_pair (ij, retry, tiny, biglim, sumb_local, nrej_local, &
+	                         & iused_ws(:,tid), latoms_ws(:,tid), storei_ws(:,tid), storej_ws(:,tid))
+	                  end do
+!$omp end do
+	                end do
+!$omp end parallel
+	                elapsed = Max (1.d-12, omp_get_wtime() - t_start)
+	                ! Eq. (1) reused for level-sweep path.
+	                edge_cost = elapsed / Dble (Max (1, nactive))
+	                if (tune_level_samples(tune_slot) == 0) then
+	                  tune_level_cost(tune_slot) = edge_cost
+	                else
+	                  ! Eq. (2) EWMA update for level mode.
+	                  tune_level_cost(tune_slot) = (1.d0-tune_alpha)*tune_level_cost(tune_slot) + tune_alpha*edge_cost
+	                end if
+	                tune_level_samples(tune_slot) = tune_level_samples(tune_slot) + 1
+
+	                sumb = sumb_local
+	                nrej = nrej_local
+	              end if
+	            else
+	              use_parallel_diagg2 = .false.
+	            end if
+
+	            deallocate (level_edges, level_pos, level_offset, level_count)
+	          end if
+	        end if
 
         deallocate (edge_level, last_occ, last_vir)
       end if
@@ -305,21 +522,15 @@
             if (i /= nvir) then
               iur = ncvir(i+1)
               incv = nnce(i+1)
-            else
-              iur = cvir_dim
-              incv = icvir_dim
-            end if
-            iur = Min (ilr+norbs-1, iur)
-            l = 0
-            do k = jlr, jur
-              l = l + 1
-              storej(l) = cocc(k)
-            end do
-            l = 0
-            do k = ilr, iur
-              l = l + 1
-              storei(l) = cvir(k)
-            end do
+	            else
+	              iur = cvir_dim
+	              incv = icvir_dim
+	            end if
+	            iur = Min (ilr+norbs-1, iur)
+	            njlen = jur - jlr + 1
+	            nilen = iur - ilr + 1
+	            storej(1:njlen) = cocc(jlr:jur)
+	            storei(1:nilen) = cvir(ilr:iur)
             !
             !   STORAGE DONE.
             !
@@ -441,16 +652,9 @@
                 !   THE ARRAY BOUNDS WERE GOING TO BE EXCEEDED.
                 !   TO PREVENT THIS, RESET THE LMOS.
                 !
-              l = 0
-              do k = jlr, jur
-                l = l + 1
-                cocc(k) = storej(l)
-              end do
-              l = 0
-              do k = ilr, iur
-                l = l + 1
-                cvir(k) = storei(l)
-              end do
+	              ! Previous-commit improvement kept here: contiguous slice rollback replaces scalar loops.
+	              cocc(jlr:jur) = storej(1:njlen)
+	              cvir(ilr:iur) = storei(1:nilen)
               ncf(j) = ncfj
               nce(i) = ncei
               do k = 1, numat
@@ -500,6 +704,7 @@
 
     integer :: i, j, ii, jur, l, ilr, incv, iur, jlr, jncf, k, le, lf, loopi, loopj
     integer :: mie, mle, mlee, mlf, mlff, ncei, ncfj
+    integer :: njlen, nilen
     double precision :: a, alpha, b, beta, c, d, e, sum
 
     i = ifmo(1, ij)
@@ -533,16 +738,11 @@
       incv = icvir_dim
     end if
     iur = Min (ilr+norbs-1, iur)
-    l = 0
-    do k = jlr, jur
-      l = l + 1
-      storej_t(l) = cocc(k)
-    end do
-    l = 0
-    do k = ilr, iur
-      l = l + 1
-      storei_t(l) = cvir(k)
-    end do
+    njlen = jur - jlr + 1
+    nilen = iur - ilr + 1
+    ! Previous-commit improvement kept here: contiguous backup copy for rollback path.
+    storej_t(1:njlen) = cocc(jlr:jur)
+    storei_t(1:nilen) = cvir(ilr:iur)
     !
     !   STORAGE DONE.
     !
@@ -621,16 +821,9 @@
       if (le <= nnce(i) + nce(i)) then
         ! Rejected due to array bounds in occupied expansion.
         nrej_acc = nrej_acc + 1
-        l = 0
-        do k = jlr, jur
-          l = l + 1
-          cocc(k) = storej_t(l)
-        end do
-        l = 0
-        do k = ilr, iur
-          l = l + 1
-          cvir(k) = storei_t(l)
-        end do
+        ! Contiguous restore (same values as pre-rotation state).
+        cocc(jlr:jur) = storej_t(1:njlen)
+        cvir(ilr:iur) = storei_t(1:nilen)
         ncf(j) = ncfj
         nce(i) = ncei
         iused_t(:) = -1
@@ -680,16 +873,9 @@
       if (lf <= nncf(j) + ncf(j)) then
         ! Rejected due to array bounds in virtual expansion.
         nrej_acc = nrej_acc + 1
-        l = 0
-        do k = jlr, jur
-          l = l + 1
-          cocc(k) = storej_t(l)
-        end do
-        l = 0
-        do k = ilr, iur
-          l = l + 1
-          cvir(k) = storei_t(l)
-        end do
+        ! Contiguous restore (same values as pre-rotation state).
+        cocc(jlr:jur) = storej_t(1:njlen)
+        cvir(ilr:iur) = storei_t(1:nilen)
         ncf(j) = ncfj
         nce(i) = ncei
         iused_t(:) = -1

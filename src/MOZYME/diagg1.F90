@@ -71,11 +71,11 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
 	      double precision, allocatable :: f(:)
 	    end type diagg1_thread_buffer
 	    type(diagg1_thread_buffer), allocatable :: buffers(:)
-	    integer, allocatable :: tid_offset(:)
+	    integer, allocatable :: owner_tid(:), owner_pos(:)
 	    double precision, allocatable :: sumt_thr(:), tiny_thr(:)
 
 	    logical :: use_parallel_diagg1
-	    integer :: nthreads_used, tid, nthreads, i_start, i_end, est, off, ncopy, pos, ijc_total
+	    integer :: nthreads_used, tid, nthreads, est, off, ncopy, pos, ijc_total, start_buf
 	    integer :: max_threads, nij_max
 	    double precision :: sumt_par, tiny_par, sumt_loc, tiny_loc
 	    integer, allocatable :: start_idx(:)
@@ -153,20 +153,20 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
 	      tiny = 0.d0
 		      if (idiagg <= 5 .or. Mod (idiagg, 2) == 0) then
 		        nfmo(1:nvir) = 0
-		        allocate (buffers(max_threads), tid_offset(max_threads), sumt_thr(max_threads), tiny_thr(max_threads))
-		        tid_offset(:) = 0
+		        allocate (buffers(max_threads), owner_tid(nvir), owner_pos(nvir), &
+		             & sumt_thr(max_threads), tiny_thr(max_threads), start_idx(nvir))
+		        owner_tid(:) = 0
+		        owner_pos(:) = 0
 		        sumt_thr(:) = 0.d0
 		        tiny_thr(:) = 0.d0
 		        nthreads_used = 1
 !$omp parallel default(shared) private(ws_loc, latoms_loc, avir_loc, aov_loc, jstore, fstore, sumt_loc, tiny_loc, &
-!$omp& sumt_par, tiny_par, l, tid, nthreads, i_start, i_end, est, i, prev_i)
+!$omp& sumt_par, tiny_par, l, tid, nthreads, est, i, prev_i, start_buf)
 			        tid = omp_get_thread_num() + 1
 			        nthreads = omp_get_num_threads()
 !$omp single
 			        nthreads_used = nthreads
 !$omp end single
-		        i_start = ((tid-1) * nvir) / nthreads + 1
-		        i_end = (tid * nvir) / nthreads
 			        est = Max (1024, (nij_max + nthreads - 1) / Max (1, nthreads))
 			        call buffer_reserve (buffers(tid), est)
 
@@ -176,7 +176,10 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
 			        tiny_loc = 0.d0
 			        prev_i = 0
 
-			        do i = i_start, i_end
+!$omp do schedule(dynamic,1)
+				        ! Irregular-work balancing: each virtual i has variable cost W_i,
+				        ! so dynamic scheduling approximates minimizing max_t(sum_{i in t} W_i).
+				        do i = 1, nvir
 			          call build_virtual (i, prev_i, ws_loc, latoms_loc, avir_loc, aov_loc, cutoff)
 			          prev_i = i
 			          call rebuild_couplings (i, ws_loc, latoms_loc, aov_loc, cutoff, flim, oldlim, jstore, fstore, &
@@ -184,8 +187,14 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
 			          nfmo(i) = l
 			          sumt_loc = sumt_loc + sumt_par
 		          tiny_loc = Max (tiny_loc, tiny_par)
-		          call buffer_append (buffers(tid), i, jstore, fstore, l)
-		        end do
+		          if (l > 0) then
+		            start_buf = buffers(tid)%n + 1
+		            call buffer_append (buffers(tid), i, jstore, fstore, l)
+		            owner_tid(i) = tid
+		            owner_pos(i) = start_buf
+		          end if
+			        end do
+!$omp end do
 
 		        sumt_thr(tid) = sumt_loc
 		        tiny_thr(tid) = tiny_loc
@@ -200,63 +209,60 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
 		          tiny = Max (tiny, tiny_thr(tid))
 		        end do
 
-		        tid_offset(1) = 1
-		        do tid = 2, nthreads_used
-		          tid_offset(tid) = tid_offset(tid-1) + buffers(tid-1)%n
-		        end do
-		        ijc_total = tid_offset(nthreads_used) + buffers(nthreads_used)%n - 1
+			        ! Eq. (1) Prefix packing offsets:
+			        !   start_idx(1) = 1
+			        !   start_idx(i) = 1 + sum_{k=1}^{i-1} nfmo(k), i>1
+			        start_idx(1) = 1
+			        do i = 2, nvir
+			          start_idx(i) = start_idx(i-1) + nfmo(i-1)
+			        end do
+			        ! Eq. (2) Total couplings after rebuild:
+			        !   ijc_total = sum_{k=1}^{nvir} nfmo(k)
+			        ijc_total = start_idx(nvir) + nfmo(nvir) - 1
 
-		        if (ijc_total <= nij_max) then
-		          ijc = ijc_total
-!$omp parallel do default(shared) private(tid, off, ncopy) schedule(static)
-		          do tid = 1, nthreads_used
-		            off = tid_offset(tid)
-		            ncopy = buffers(tid)%n
-		            if (ncopy > 0) then
-		              ifmo(1, off:off+ncopy-1) = buffers(tid)%i(1:ncopy)
-		              ifmo(2, off:off+ncopy-1) = buffers(tid)%j(1:ncopy)
-		              fmo(off:off+ncopy-1) = buffers(tid)%f(1:ncopy)
-		            end if
+			        if (ijc_total <= nij_max) then
+			          ijc = ijc_total
+!$omp parallel do default(shared) private(i, l, tid, pos, off) schedule(static)
+		          do i = 1, nvir
+		            l = nfmo(i)
+		            if (l <= 0) cycle
+		            tid = owner_tid(i)
+		            pos = owner_pos(i)
+		            off = start_idx(i)
+			            ! Deterministic mapping (virtual-major order):
+			            ! off = start_idx(i), block length = nfmo(i)
+			            ifmo(1, off:off+l-1) = i
+		            ifmo(2, off:off+l-1) = buffers(tid)%j(pos:pos+l-1)
+		            fmo(off:off+l-1) = buffers(tid)%f(pos:pos+l-1)
 		          end do
 !$omp end parallel do
 		        else
 		          ijc = 0
-		          outer_pack: do tid = 1, nthreads_used
-		            i_start = ((tid-1) * nvir) / nthreads_used + 1
-		            i_end = (tid * nvir) / nthreads_used
-		            pos = 0
-		            do i = i_start, i_end
-		              l = nfmo(i)
-		              if (l <= 0) cycle
-		              if (ijc == nij_max) then
-		                nfmo(i) = 0
-		                cycle
-		              end if
-		              ncopy = Min (l, nij_max - ijc)
-		              if (ncopy > 0) then
-		                ifmo(1, ijc+1:ijc+ncopy) = i
-		                ifmo(2, ijc+1:ijc+ncopy) = buffers(tid)%j(pos+1:pos+ncopy)
-		                fmo(ijc+1:ijc+ncopy) = buffers(tid)%f(pos+1:pos+ncopy)
-		                ijc = ijc + ncopy
-		              end if
-		              if (ncopy < l) then
-		                nfmo(i) = ncopy
-		                do j = i + 1, i_end
-		                  nfmo(j) = 0
-		                end do
-		                do j = tid + 1, nthreads_used
-		                  i1 = ((j-1) * nvir) / nthreads_used + 1
-		                  i2 = (j * nvir) / nthreads_used
-		                  nfmo(i1:i2) = 0
-		                end do
-		                exit outer_pack
-		              end if
-		              pos = pos + l
-		            end do
-		          end do outer_pack
+		          do i = 1, nvir
+		            l = nfmo(i)
+		            if (l <= 0) cycle
+		            if (ijc == nij_max) then
+		              nfmo(i:nvir) = 0
+		              exit
+		            end if
+		            ncopy = Min (l, nij_max - ijc)
+		            if (ncopy > 0) then
+		              tid = owner_tid(i)
+		              pos = owner_pos(i)
+		              ifmo(1, ijc+1:ijc+ncopy) = i
+		              ifmo(2, ijc+1:ijc+ncopy) = buffers(tid)%j(pos:pos+ncopy-1)
+		              fmo(ijc+1:ijc+ncopy) = buffers(tid)%f(pos:pos+ncopy-1)
+		              ijc = ijc + ncopy
+		            end if
+		            if (ncopy < l) then
+		              nfmo(i) = ncopy
+		              if (i < nvir) nfmo(i+1:nvir) = 0
+		              exit
+		            end if
+		          end do
 		        end if
 
-		        deallocate (buffers, tid_offset, sumt_thr, tiny_thr)
+		        deallocate (buffers, owner_tid, owner_pos, sumt_thr, tiny_thr, start_idx)
 		      else
 		        allocate (start_idx(nvir))
 		        start_idx(1) = 1
@@ -271,7 +277,7 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
 !$omp& reduction(+:sumt_par) reduction(max:tiny_par)
 		        allocate (ws_loc(norbs), latoms_loc(numat), avir_loc(numat), aov_loc(numat))
 		        prev_i = 0
-!$omp do schedule(static)
+!$omp do schedule(dynamic,1)
 		        do i = 1, nvir
 		          call build_virtual (i, prev_i, ws_loc, latoms_loc, avir_loc, aov_loc, cutoff)
 		          prev_i = i

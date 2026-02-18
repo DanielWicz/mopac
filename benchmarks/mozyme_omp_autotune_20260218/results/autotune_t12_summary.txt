@@ -1,0 +1,6 @@
+threads=12 runs=3
+wall_mean_s=16.06333333
+wall_std_s=0.74191194
+diagg2_mean_s=5.10333333
+diagg2_std_s=0.30171731
+hof_kj_values=[-41628.25838, -41628.25838, -41628.25838]
