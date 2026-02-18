@@ -384,7 +384,8 @@
 	                batch_target = Min (batch_max, Max (batch_min, tune_batch(tune_slot)))
 
 	                t_start = omp_get_wtime()
-!$omp parallel num_threads(diagg2_threads) default(shared) private(ij, lvl, pos, tid, i_task, j_task, batch_start, batch_end, batch_edges)
+!$omp parallel num_threads(diagg2_threads) default(shared) &
+!$omp& private(ij, lvl, pos, tid, i_task, j_task, batch_start, batch_end, batch_edges)
 	                tid = omp_get_thread_num() + 1
 	                iused_ws(:, tid) = -1
 	                latoms_ws(:, tid) = .false.
