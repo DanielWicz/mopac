@@ -32,7 +32,7 @@
     use parameters_C, only: main_group
     use chanel_C, only: iw
 #ifdef _OPENMP
-    use omp_lib, only: omp_get_max_threads, omp_get_thread_num, omp_get_wtime
+	    use omp_lib, only: omp_get_max_threads, omp_get_thread_num, omp_get_wtime
 #endif
     implicit none
     integer, intent (in) :: idiagg, nij, nocc, nvir
@@ -54,26 +54,31 @@
     integer, dimension (2) :: nrejct
     data nrejct / 2 * 0 /
 #ifdef _OPENMP
-	    integer, parameter :: mode_level = 1, mode_task = 2
-	    double precision, parameter :: tune_alpha = 0.25d0, tune_switch_margin = 1.02d0
-	    integer, parameter :: tune_explore_period = 24
-	    integer :: alloc_stat, max_threads, tid, diagg2_threads, width_hint
-	    integer :: lvl, max_level, max_level_est, nactive, pos
-	    integer :: batch_start, batch_end, batch_target, batch_edges
-	    integer :: batch_min, batch_max
-	    integer :: i_task, j_task
-	    integer :: mode_selected, mode_used, tune_slot
-	    integer :: tune_calls_slot
-    logical :: task_capable, force_explore
-    double precision :: t_start, elapsed, edge_cost
-	    integer, allocatable :: edge_level(:), active_edges(:), last_occ(:), last_vir(:)
-	    integer, allocatable :: rem_edges(:), next_edges(:)
-	    integer, allocatable :: level_count(:), level_offset(:), level_pos(:), level_edges(:)
-	    integer, allocatable, save :: iused_ws(:,:)
-	    logical, allocatable, save :: latoms_ws(:,:)
-	    double precision, allocatable, save :: storei_ws(:,:), storej_ws(:,:)
-	    double precision, allocatable :: sumb_thread(:)
-	    integer, allocatable :: nrej_thread(:)
+		    integer, parameter :: mode_level = 1, mode_task = 2
+		    double precision, parameter :: tune_alpha = 0.25d0, tune_switch_margin = 1.02d0
+		    integer, parameter :: tune_explore_period = 24
+		    integer :: alloc_stat, max_threads, tid, diagg2_threads, width_hint
+		    integer :: lvl, max_level, max_level_est, nactive, pos
+		    integer :: filter_threads, filter_tid, filter_start, filter_end
+		    integer, allocatable :: filter_count(:), filter_offset(:)
+		    integer :: batch_start, batch_end, batch_target, batch_edges
+		    integer :: batch_min, batch_max
+		    integer :: i_task, j_task
+		    integer :: mode_selected, mode_used, tune_slot
+		    integer :: tune_calls_slot
+	    logical :: task_capable, force_explore
+	    double precision :: t_start, elapsed, edge_cost
+		    integer, allocatable :: edge_level(:), active_edges(:), last_occ(:), last_vir(:)
+		    integer, allocatable :: rem_edges(:), next_edges(:)
+		    integer, allocatable :: level_count(:), level_offset(:), level_pos(:), level_edges(:)
+		    integer :: max_deg, key
+		    integer, allocatable :: deg_occ(:), deg_vir(:)
+		    integer, allocatable :: bucket_count(:), bucket_pos(:)
+		    integer, allocatable, save :: iused_ws(:,:)
+		    logical, allocatable, save :: latoms_ws(:,:)
+		    double precision, allocatable, save :: storei_ws(:,:), storej_ws(:,:)
+		    double precision, allocatable :: sumb_thread(:)
+		    integer, allocatable :: nrej_thread(:)
 	    logical :: need_ws_resize
 	    logical :: active
 	    integer :: occ_span_max, vir_span_max, nrem, nnext, iedge
@@ -188,48 +193,153 @@
 #ifdef _OPENMP
 	    max_threads = omp_get_max_threads()
 	    use_parallel_diagg2 = (max_threads > 1 .and. nij > 64)
-	    if (use_parallel_diagg2) then
-	      allocate (edge_level(nij), active_edges(nij), rem_edges(nij), next_edges(nij), &
-	           & last_occ(nocc), last_vir(nvir), stat=alloc_stat)
-	      if (alloc_stat /= 0) then
-	        call mopend("Insufficient memory to run DIAGG2 (parallel scheduling)")
-	        use_parallel_diagg2 = .false.
-	      else
-	        edge_level(:) = 0
-	        nactive = 0
-	        !
-	        ! Filter active pairs using the same tiny/biglim criterion as the rotation kernel.
-	        !
-	        do ij = 1, nij
-	          i = ifmo(1, ij)
-	          j = ifmo(2, ij)
+		    if (use_parallel_diagg2) then
+		      allocate (edge_level(nij), active_edges(nij), rem_edges(nij), next_edges(nij), &
+		           & last_occ(nocc), last_vir(nvir), stat=alloc_stat)
+		      if (alloc_stat /= 0) then
+		        call mopend("Insufficient memory to run DIAGG2 (parallel scheduling)")
+		        use_parallel_diagg2 = .false.
+		      else
+		        edge_level(:) = 0
+		        nactive = 0
+		        !
+		        ! Filter active pairs using the same tiny/biglim criterion as the rotation kernel.
+		        !
+		        !
+		        ! Parallelize the ij scan (nij may be large) while preserving deterministic
+		        ! ij ordering in active_edges(1:nactive).
+		        !
+		        filter_threads = max_threads
+		        allocate (filter_count(filter_threads), filter_offset(filter_threads+1), stat=alloc_stat)
+		        if (alloc_stat /= 0) then
+		          call mopend("Insufficient memory to run DIAGG2 (active filter)")
+		        end if
+		        filter_count(:) = 0
+		        !
+		        ! Eq. (D5): per-thread count of active edges over a static ij partition.
+		        !
+		        !$omp parallel default(shared) &
+		        !$omp& private(filter_tid, filter_start, filter_end, ij, i, j, active, c, d)
+		          filter_tid = omp_get_thread_num() + 1
+		          filter_start = ( (filter_tid-1) * nij ) / filter_threads + 1
+		          filter_end   = ( filter_tid * nij ) / filter_threads
+		          do ij = filter_start, filter_end
+		            i = ifmo(1, ij)
+		            j = ifmo(2, ij)
+		            active = .true.
+		            if (tiny >= 0.d0) then
+		              if (Abs (fmo(ij)) < tiny) active = .false.
+		            end if
+		            if (active .and. biglim >= 0.d0) then
+		              c = fmo(ij) * const
+		              d = eigs(j) - eigv(i) - shift
+		              if (d == 0.d0) then
+		                active = (Abs(c) > 0.d0)
+		              else
+		                active = (Abs (c/d) >= biglim)
+		              end if
+		            end if
+		            if (active) then
+		              edge_level(ij) = 1
+		              filter_count(filter_tid) = filter_count(filter_tid) + 1
+		            end if
+		          end do
+		        !$omp end parallel
+		        !
+		        ! Exclusive prefix sum of counts to get deterministic per-thread output ranges.
+		        !
+		        filter_offset(1) = 1
+		        do filter_tid = 1, filter_threads
+		          filter_offset(filter_tid+1) = filter_offset(filter_tid) + filter_count(filter_tid)
+		        end do
+		        nactive = filter_offset(filter_threads+1) - 1
+		        !
+		        ! Scatter active ij into active_edges in ascending ij order.
+		        !
+		        !$omp parallel default(shared) &
+		        !$omp& private(filter_tid, filter_start, filter_end, ij, pos)
+		          filter_tid = omp_get_thread_num() + 1
+		          filter_start = ( (filter_tid-1) * nij ) / filter_threads + 1
+		          filter_end   = ( filter_tid * nij ) / filter_threads
+		          pos = filter_offset(filter_tid)
+		          do ij = filter_start, filter_end
+		            if (edge_level(ij) == 1) then
+		              active_edges(pos) = ij
+		              pos = pos + 1
+		            end if
+		          end do
+		        !$omp end parallel
+		        !
+		        ! Reset markers so edge_level is available for later level assignment.
+		        !
+		        do pos = 1, nactive
+		          edge_level(active_edges(pos)) = 0
+		        end do
+		        deallocate (filter_count, filter_offset)
 
-          active = .true.
-          if (tiny >= 0.d0) then
-            if (Abs (fmo(ij)) < tiny) active = .false.
-          end if
-
-          if (active .and. biglim >= 0.d0) then
-            c = fmo(ij) * const
-            d = eigs(j) - eigv(i) - shift
-            if (d == 0.d0) then
-              active = (Abs(c) > 0.d0)
-            else
-              active = (Abs (c/d) >= biglim)
-            end if
-          end if
-
-	          if (active) then
-	            nactive = nactive + 1
-	            active_edges(nactive) = ij
-	          end if
-	        end do
-
-	        if (nactive > 0) then
-	          !
-	          ! Eq. (D0): one-pass level-depth estimate
-	          !   l(e_k) = 1 + max(last_occ(j_k), last_vir(i_k))
-	          ! gives an upper bound for schedule depth at O(nactive) cost.
+		        if (nactive > 0) then
+		          !
+		          ! Degree-aware edge ordering (deterministic, stable) to reduce schedule depth.
+		          !
+		          allocate (deg_occ(nocc), deg_vir(nvir), stat=alloc_stat)
+		          if (alloc_stat /= 0) then
+		            call mopend("Insufficient memory to run DIAGG2 (edge degrees)")
+		          end if
+		          deg_occ(:) = 0
+		          deg_vir(:) = 0
+		          do iedge = 1, nactive
+		            ij = active_edges(iedge)
+		            i = ifmo(1, ij)
+		            j = ifmo(2, ij)
+		            deg_occ(j) = deg_occ(j) + 1
+		            deg_vir(i) = deg_vir(i) + 1
+		          end do
+		          max_deg = 0
+		          do j = 1, nocc
+		            max_deg = Max (max_deg, deg_occ(j))
+		          end do
+		          do i = 1, nvir
+		            max_deg = Max (max_deg, deg_vir(i))
+		          end do
+		          !
+		          ! Eq. (D6): key(e=(i,j)) = max(deg_occ(j), deg_vir(i)).
+		          ! Stable counting sort by descending key clusters high-degree nodes early,
+		          ! improving the greedy matching fill and reducing max_level/barriers.
+		          !
+		          if (max_deg > 1) then
+		            allocate (bucket_count(max_deg), bucket_pos(max_deg), stat=alloc_stat)
+		            if (alloc_stat /= 0) then
+		              call mopend("Insufficient memory to run DIAGG2 (edge ordering)")
+		            end if
+		            bucket_count(:) = 0
+		            do iedge = 1, nactive
+		              ij = active_edges(iedge)
+		              i = ifmo(1, ij)
+		              j = ifmo(2, ij)
+		              key = Max (deg_occ(j), deg_vir(i))
+		              bucket_count(key) = bucket_count(key) + 1
+		            end do
+		            bucket_pos(max_deg) = 1
+		            do key = max_deg - 1, 1, -1
+		              bucket_pos(key) = bucket_pos(key+1) + bucket_count(key+1)
+		            end do
+		            do iedge = 1, nactive
+		              ij = active_edges(iedge)
+		              i = ifmo(1, ij)
+		              j = ifmo(2, ij)
+		              key = Max (deg_occ(j), deg_vir(i))
+		              pos = bucket_pos(key)
+		              next_edges(pos) = ij
+		              bucket_pos(key) = pos + 1
+		            end do
+		            active_edges(1:nactive) = next_edges(1:nactive)
+		            deallocate (bucket_count, bucket_pos)
+		          end if
+		          deallocate (deg_occ, deg_vir)
+		          !
+		          ! Eq. (D0): one-pass level-depth estimate
+		          !   l(e_k) = 1 + max(last_occ(j_k), last_vir(i_k))
+		          ! gives an upper bound for schedule depth at O(nactive) cost.
 	          ! Used for thread-width and mode selection before deciding whether
 	          ! the full repeated-maximal-matching schedule is required.
 	          !
@@ -352,10 +462,14 @@
 	                tune_batch_dir(tune_slot) = 1
 	              end if
 
-	              tune_calls(tune_slot) = tune_calls(tune_slot) + 1
-	              tune_calls_slot = tune_calls(tune_slot)
-	              task_capable = (max_level_est > 1 .and. nactive >= 2*diagg2_threads)
-	              mode_selected = mode_level
+		              tune_calls(tune_slot) = tune_calls(tune_slot) + 1
+		              tune_calls_slot = tune_calls(tune_slot)
+		              !
+		              ! Avoid task mode when it is unlikely to amortize task/depend overhead.
+		              ! Heuristic: require enough work per thread (k tasks/thread).
+		              !
+		              task_capable = (max_level_est > 1 .and. nactive >= 8*diagg2_threads)
+		              mode_selected = mode_level
 
 	              if (task_capable) then
 	                if (tune_level_samples(tune_slot) == 0) then
@@ -463,17 +577,17 @@
 	                  nrej = nrej + nrej_thread(tid)
 	                end do
 	                deallocate (sumb_thread, nrej_thread)
-	              else
-	                !
-	                ! Eq. (D1): build exact level schedule only when level mode is selected.
+		              else
+		                !
+		                ! Eq. (D1): build exact level schedule only when level mode is selected.
 	                ! Repeated maximal matchings M_k satisfy:
 	                !   e=(i,j) in M_k => i and j are unique within level k.
 	                ! This preserves conflict-free pair rotations in each level.
 	                !
-	                edge_level(:) = 0
-	                last_occ(:) = 0
-	                last_vir(:) = 0
-	                rem_edges(1:nactive) = active_edges(1:nactive)
+			                edge_level(:) = 0
+			                last_occ(:) = 0
+			                last_vir(:) = 0
+			                rem_edges(1:nactive) = active_edges(1:nactive)
 	                nrem = nactive
 	                max_level = 0
 	                do while (nrem > 0)
@@ -525,12 +639,12 @@
 	                  level_pos(lvl) = pos + 1
 	                end do
 
-	                sumb_local = 0.d0
-	                nrej_local = 0
-	                t_start = omp_get_wtime()
+			                sumb_local = 0.d0
+			                nrej_local = 0
+			                t_start = omp_get_wtime()
 !$omp parallel num_threads(diagg2_threads) default(shared) private(ij, lvl, pos, tid) &
 !$omp& reduction(+:sumb_local, nrej_local)
-	                tid = omp_get_thread_num() + 1
+			                tid = omp_get_thread_num() + 1
 
 	                do lvl = 1, max_level
 !$omp do schedule(dynamic,16)
