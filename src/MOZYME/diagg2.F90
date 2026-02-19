@@ -53,6 +53,11 @@
     double precision, external :: reada
     integer, dimension (2) :: nrejct
     data nrejct / 2 * 0 /
+    !
+    ! Cluster width for DIAGG2 multi-neighbor updates in the OpenMP level scheduler.
+    ! Kept outside of _OPENMP guards so the file also compiles when OpenMP is disabled.
+    !
+    integer, parameter :: diagg2_block_cap = 4
 #ifdef _OPENMP
 		    integer, parameter :: mode_level = 1, mode_task = 2
 		    double precision, parameter :: tune_alpha = 0.25d0, tune_switch_margin = 1.02d0
@@ -71,12 +76,21 @@
 		    integer, allocatable :: edge_level(:), active_edges(:), last_occ(:), last_vir(:)
 		    integer, allocatable :: rem_edges(:), next_edges(:)
 		    integer, allocatable :: level_count(:), level_offset(:), level_pos(:), level_edges(:)
-		    integer :: max_deg, key
+		    integer :: max_deg, max_deg_occ, max_deg_vir, key
 		    integer, allocatable :: deg_occ(:), deg_vir(:)
 		    integer, allocatable :: bucket_count(:), bucket_pos(:)
+		    integer :: block_row_max
+		    integer :: block_cap, nblocks, blk
+		    integer, allocatable :: occ_block_id(:)
+		    integer, allocatable :: occ_count(:)
+		    integer, allocatable :: level_block_offset(:)
+		    integer, allocatable :: block_occ(:), block_nedges(:)
+		    integer, allocatable :: block_edges(:,:)
 		    integer, allocatable, save :: iused_ws(:,:)
 		    logical, allocatable, save :: latoms_ws(:,:)
 		    double precision, allocatable, save :: storei_ws(:,:), storej_ws(:,:)
+		    double precision, allocatable, save :: block_c_ws(:,:,:), block_c2_ws(:,:,:)
+		    integer, allocatable, save :: block_atoms_ws(:,:)
 		    double precision, allocatable :: sumb_thread(:)
 		    integer, allocatable :: nrej_thread(:)
 	    logical :: need_ws_resize
@@ -294,13 +308,15 @@
 		            deg_occ(j) = deg_occ(j) + 1
 		            deg_vir(i) = deg_vir(i) + 1
 		          end do
-		          max_deg = 0
+		          max_deg_occ = 0
 		          do j = 1, nocc
-		            max_deg = Max (max_deg, deg_occ(j))
+		            max_deg_occ = Max (max_deg_occ, deg_occ(j))
 		          end do
+		          max_deg_vir = 0
 		          do i = 1, nvir
-		            max_deg = Max (max_deg, deg_vir(i))
+		            max_deg_vir = Max (max_deg_vir, deg_vir(i))
 		          end do
+		          max_deg = Max (max_deg_occ, max_deg_vir)
 		          !
 		          ! Eq. (D6): key(e=(i,j)) = max(deg_occ(j), deg_vir(i)).
 		          ! Stable counting sort by descending key clusters high-degree nodes early,
@@ -386,6 +402,11 @@
 		                iur = Min (ilr+norbs-1, iur)
 		                vir_span_max = Max (vir_span_max, iur - ilr + 1)
 		              end do
+		              !
+		              ! Block workspace rows bound: union(AO) over one occupied + up to diagg2_block_cap virtuals.
+		              ! Eq. (B0): m_max <= min(norbs, span_occ_max + k*span_vir_max), k = diagg2_block_cap
+		              !
+		              block_row_max = Min (norbs, occ_span_max + diagg2_block_cap * vir_span_max)
 		              need_ws_resize = .true.
 		              ! Previous-commit improvement kept here: persistent per-thread scratch reuse.
 		              ! Allocation is skipped when dimensions already satisfy:
@@ -395,7 +416,13 @@
 		                if (size(iused_ws,1) >= numat .and. size(iused_ws,2) >= diagg2_threads .and. &
 		                   & size(latoms_ws,1) >= numat .and. size(latoms_ws,2) >= diagg2_threads .and. &
 		                   & size(storei_ws,1) >= vir_span_max .and. size(storei_ws,2) >= diagg2_threads .and. &
-		                   & size(storej_ws,1) >= occ_span_max .and. size(storej_ws,2) >= diagg2_threads) then
+		                   & size(storej_ws,1) >= occ_span_max .and. size(storej_ws,2) >= diagg2_threads .and. &
+		                   & allocated(block_c_ws) .and. allocated(block_c2_ws) .and. allocated(block_atoms_ws) .and. &
+		                   & size(block_c_ws,1) >= block_row_max .and. size(block_c_ws,2) >= diagg2_block_cap+1 .and. &
+		                   & size(block_c_ws,3) >= diagg2_threads .and. &
+		                   & size(block_c2_ws,1) >= block_row_max .and. size(block_c2_ws,2) >= diagg2_block_cap+1 .and. &
+		                   & size(block_c2_ws,3) >= diagg2_threads .and. &
+		                   & size(block_atoms_ws,1) >= numat .and. size(block_atoms_ws,2) >= diagg2_threads) then
 		                  need_ws_resize = .false.
 		                end if
 		              end if
@@ -405,11 +432,17 @@
 	                if (allocated(latoms_ws)) deallocate (latoms_ws)
 	                if (allocated(storei_ws)) deallocate (storei_ws)
 	                if (allocated(storej_ws)) deallocate (storej_ws)
+	                if (allocated(block_c_ws)) deallocate (block_c_ws)
+	                if (allocated(block_c2_ws)) deallocate (block_c2_ws)
+	                if (allocated(block_atoms_ws)) deallocate (block_atoms_ws)
 
 		                ! Scratch footprint scales as O((numat + span_occ + span_vir)*threads), reused.
 	                allocate (iused_ws(numat, diagg2_threads), latoms_ws(numat, diagg2_threads), &
 	                     & storei_ws(vir_span_max, diagg2_threads), &
-	                     & storej_ws(occ_span_max, diagg2_threads), stat=alloc_stat)
+	                     & storej_ws(occ_span_max, diagg2_threads), &
+	                     & block_c_ws(block_row_max, diagg2_block_cap+1, diagg2_threads), &
+	                     & block_c2_ws(block_row_max, diagg2_block_cap+1, diagg2_threads), &
+	                     & block_atoms_ws(numat, diagg2_threads), stat=alloc_stat)
 	                if (alloc_stat /= 0) then
 	                  call mopend("Insufficient memory to run DIAGG2 (parallel scratch workspace)")
 	                end if
@@ -579,83 +612,103 @@
 	                deallocate (sumb_thread, nrej_thread)
 		              else
 		                !
-		                ! Eq. (D1): build exact level schedule only when level mode is selected.
-	                ! Repeated maximal matchings M_k satisfy:
-	                !   e=(i,j) in M_k => i and j are unique within level k.
-	                ! This preserves conflict-free pair rotations in each level.
+	                ! Blocked level schedule:
+	                !   - virtual indices are unique within each level
+	                !   - an occupied index may appear up to k times per level (k = diagg2_block_cap)
+	                ! This reduces barrier depth for high-degree occupied LMOs by performing
+	                ! a cluster update (occupied + up to k virtuals) inside one unit.
 	                !
-			                edge_level(:) = 0
-			                last_occ(:) = 0
-			                last_vir(:) = 0
-			                rem_edges(1:nactive) = active_edges(1:nactive)
+	                ! Eq. (L1) Level constraint:
+	                !   for all levels l:
+	                !     each i in V appears at most once in level l
+	                !     each j in O appears at most k times in level l
+	                !
+	                ! Within a block (fixed j), we apply the same sequence of 2x2 Jacobi rotations
+	                ! as in process_pair, but as a single dense right-multiply:
+	                !   C_new = C_old * U,  U = product_p R_p, where R_p mixes columns (j,i_p):
+	                !     R_p = [[alpha_p, -beta_p],[beta_p, alpha_p]] on (occ, vir_p)
+	                ! computed from the existing pairwise Jacobi formula.
+	                !
+		                block_cap = diagg2_block_cap
+	                allocate (occ_block_id(nocc), occ_count(nocc), level_block_offset(max_level_est+2), &
+	                     & block_occ(nactive), block_nedges(nactive), block_edges(block_cap, nactive), stat=alloc_stat)
+	                if (alloc_stat /= 0) then
+	                  call mopend("Insufficient memory to run DIAGG2 (blocked level schedule)")
+	                end if
+	                block_edges(:, :) = 0
+
+	                rem_edges(1:nactive) = active_edges(1:nactive)
 	                nrem = nactive
 	                max_level = 0
+	                nblocks = 0
+	                level_block_offset(1) = 1
+	                last_occ(:) = 0
+	                last_vir(:) = 0
+	                occ_count(:) = 0
+	                occ_block_id(:) = 0
+
 	                do while (nrem > 0)
 	                  max_level = max_level + 1
 	                  nnext = 0
+
 	                  do iedge = 1, nrem
 	                    ij = rem_edges(iedge)
 	                    i = ifmo(1, ij)
 	                    j = ifmo(2, ij)
-	                    if (last_occ(j) == max_level .or. last_vir(i) == max_level) then
+	                    if (last_vir(i) == max_level) then
 	                      nnext = nnext + 1
 	                      next_edges(nnext) = ij
 	                    else
-	                      edge_level(ij) = max_level
-	                      last_occ(j) = max_level
-	                      last_vir(i) = max_level
+	                      if (last_occ(j) /= max_level) then
+	                        last_occ(j) = max_level
+	                        occ_count(j) = 0
+	                        occ_block_id(j) = 0
+	                      end if
+	                      if (occ_count(j) >= block_cap) then
+	                        nnext = nnext + 1
+	                        next_edges(nnext) = ij
+	                      else
+	                        last_vir(i) = max_level
+	                        occ_count(j) = occ_count(j) + 1
+	                        blk = occ_block_id(j)
+	                        if (blk == 0) then
+	                          nblocks = nblocks + 1
+	                          blk = nblocks
+	                          occ_block_id(j) = blk
+	                          block_occ(blk) = j
+	                          block_nedges(blk) = 0
+	                        end if
+	                        block_nedges(blk) = block_nedges(blk) + 1
+	                        block_edges(block_nedges(blk), blk) = ij
+	                      end if
 	                    end if
 	                  end do
+
+	                  level_block_offset(max_level+1) = nblocks + 1
 	                  if (nnext > 0) rem_edges(1:nnext) = next_edges(1:nnext)
 	                  nrem = nnext
 	                end do
 
-	                if (allocated(level_count)) deallocate (level_count)
-	                if (allocated(level_offset)) deallocate (level_offset)
-	                if (allocated(level_pos)) deallocate (level_pos)
-	                if (allocated(level_edges)) deallocate (level_edges)
-	                allocate (level_count(max_level), level_offset(max_level+1), level_pos(max_level), &
-	                     & level_edges(nactive), stat=alloc_stat)
-	                if (alloc_stat /= 0) then
-	                  call mopend("Insufficient memory to run DIAGG2 (level schedule)")
-	                end if
-
-	                level_count(:) = 0
-	                do iedge = 1, nactive
-	                  ij = active_edges(iedge)
-	                  lvl = edge_level(ij)
-	                  level_count(lvl) = level_count(lvl) + 1
-	                end do
-	                level_offset(1) = 1
-	                do lvl = 1, max_level
-	                  level_offset(lvl+1) = level_offset(lvl) + level_count(lvl)
-	                end do
-	                level_pos(:) = level_offset(1:max_level)
-	                do iedge = 1, nactive
-	                  ij = active_edges(iedge)
-	                  lvl = edge_level(ij)
-	                  pos = level_pos(lvl)
-	                  level_edges(pos) = ij
-	                  level_pos(lvl) = pos + 1
-	                end do
-
-			                sumb_local = 0.d0
-			                nrej_local = 0
-			                t_start = omp_get_wtime()
-!$omp parallel num_threads(diagg2_threads) default(shared) private(ij, lvl, pos, tid) &
+	                sumb_local = 0.d0
+	                nrej_local = 0
+	                t_start = omp_get_wtime()
+!$omp parallel num_threads(diagg2_threads) default(shared) private(lvl, tid, blk) &
 !$omp& reduction(+:sumb_local, nrej_local)
-			                tid = omp_get_thread_num() + 1
+	                tid = omp_get_thread_num() + 1
 
 	                do lvl = 1, max_level
-!$omp do schedule(dynamic,16)
-	                  do pos = level_offset(lvl), level_offset(lvl+1) - 1
-	                    ij = level_edges(pos)
-	                    call process_pair (ij, retry, tiny, biglim, sumb_local, nrej_local, &
-	                         & iused_ws(:,tid), latoms_ws(:,tid), storei_ws(:,tid), storej_ws(:,tid))
+!$omp do schedule(dynamic,1)
+	                  do blk = level_block_offset(lvl), level_block_offset(lvl+1) - 1
+	                    call process_occ_block (block_occ(blk), block_nedges(blk), block_edges(:, blk), &
+	                         & retry, tiny, biglim, sumb_local, nrej_local, &
+	                         & iused_ws(:,tid), latoms_ws(:,tid), storei_ws(:,tid), storej_ws(:,tid), &
+	                         & block_c_ws(:,:,tid), block_c2_ws(:,:,tid), block_atoms_ws(:,tid))
 	                  end do
 !$omp end do
 	                end do
 !$omp end parallel
+
+	                deallocate (block_edges, block_nedges, block_occ, level_block_offset, occ_count, occ_block_id)
 	                elapsed = Max (1.d-12, omp_get_wtime() - t_start)
 	                ! Eq. (1) reused for level-sweep path.
 	                edge_cost = elapsed / Dble (Max (1, nactive))
@@ -900,6 +953,421 @@
       call timer (" AFTER DIAGG2 IN ITER")
     end if
   contains
+	  subroutine process_occ_block (j_occ, nedges, edges, retry, tiny, biglim, sumb_acc, nrej_acc, &
+	       & iused_t, latoms_t, storei_t, storej_t, cwork, cwork2, atomwork)
+    !***********************************************************************
+    !
+    ! Blocked/clustered DIAGG2 update for one occupied LMO j_occ and up to
+    ! k virtual neighbors (nedges <= diagg2_block_cap) inside one DIAGG2 level.
+    !
+    ! Motivation:
+    ! - High-degree occupied LMOs force many levels when each level allows
+    !   only one (i,j) per occupied. Allowing up to k edges per occupied per
+    !   level reduces barrier depth and improves scaling.
+    !
+    ! Math:
+    ! - Each pair (j,i_p) uses the same Jacobi rotation as process_pair:
+    !     a' = alpha_p*a + beta_p*b
+    !     b' = alpha_p*b - beta_p*a
+    !   where a = occ(j), b = vir(i_p).
+    ! - We apply the product of these rotations as a single dense update on
+    !   the packed coefficient matrix C (AO rows x orbital columns):
+    !     C_new = C_old * U
+    !   where U is built by composing the 2x2 rotations on columns (1, p+1).
+    !
+    ! Pruning/expansion semantics:
+    ! - Existing atoms in each LMO are always retained (no deletions here).
+    ! - Atoms not present in an LMO are appended iff their per-atom 2-norm
+    !   after the block update exceeds thresh (same threshold meaning as the
+    !   pairwise expansion tests, generalized).
+    !
+    ! Safety:
+    ! - If any orbital would exceed its reserved storage bounds, we fall
+    !   back to calling process_pair for each edge (original behavior).
+    !***********************************************************************
+    integer, intent (in) :: j_occ, nedges
+    integer, dimension (:), intent (in) :: edges
+    logical, intent (in) :: retry
+    double precision, intent (in) :: tiny, biglim
+    double precision, intent (inout) :: sumb_acc
+	    integer, intent (inout) :: nrej_acc
+	    integer, dimension (numat), intent (inout) :: iused_t
+	    logical, dimension (numat), intent (inout) :: latoms_t
+	    double precision, dimension (:), intent (inout) :: storei_t, storej_t
+	    double precision, dimension (:,:), intent (inout) :: cwork, cwork2
+	    integer, dimension (:), intent (inout) :: atomwork
+
+	    integer :: p, q
+	    integer :: ij, i_vir, col, ncols
+	    integer :: lf, le, atom, len, row
+	    integer :: base, pos
+	    integer :: nunion, m
+	    integer :: jlr, jur, jncf
+	    integer :: ilr, iur, incv
+	    integer :: add_atoms, add_len
+	    integer :: ncf_new, nce_new
+	    integer :: attempt, max_attempt
+	    integer :: ao
+	    logical :: ok
+	    double precision :: a, b, c, d, e, alpha, beta, u1, up
+	    double precision :: norm2
+	    double precision :: alpha_vec(diagg2_block_cap), beta_vec(diagg2_block_cap), c_vec(diagg2_block_cap)
+	    double precision :: u_mat(diagg2_block_cap+1, diagg2_block_cap+1)
+	    integer :: i_list(diagg2_block_cap)
+
+	    if (nedges <= 0) return
+	    if (nedges == 1) then
+	      call process_pair (edges(1), retry, tiny, biglim, sumb_acc, nrej_acc, iused_t, latoms_t, storei_t, storej_t)
+	      return
+	    end if
+
+	    do p = 1, nedges
+	      ij = edges(p)
+	      i_list(p) = ifmo(1, ij)
+	      if (ifmo(2, ij) /= j_occ) then
+	        ! Defensive fallback if schedule bookkeeping is inconsistent.
+	        goto 9000
+	      end if
+	    end do
+
+	    ! Build union atom list and AO row offsets (stored in iused_t(atom) as 0-based offset).
+	    nunion = 0
+	    m = 0
+	    do lf = nncf(j_occ) + 1, nncf(j_occ) + ncf(j_occ)
+	      atom = icocc(lf)
+	      if (iused_t(atom) < 0) then
+	        nunion = nunion + 1
+	        atomwork(nunion) = atom
+	        iused_t(atom) = m
+	        m = m + iorbs(atom)
+	      end if
+	    end do
+	    do p = 1, nedges
+	      i_vir = i_list(p)
+	      do le = nnce(i_vir) + 1, nnce(i_vir) + nce(i_vir)
+	        atom = icvir(le)
+	        if (iused_t(atom) < 0) then
+	          nunion = nunion + 1
+	          atomwork(nunion) = atom
+	          iused_t(atom) = m
+	          m = m + iorbs(atom)
+	        end if
+	      end do
+	    end do
+
+	    ncols = 1 + nedges
+	    if (m <= 0) goto 8000
+	    if (m > size(cwork,1) .or. ncols > size(cwork,2)) then
+	      goto 9000
+	    end if
+
+	    cwork(1:m, 1:ncols) = 0.d0
+
+	    ! Pack occupied column.
+	    base = ncocc(j_occ)
+	    pos = 0
+	    do lf = nncf(j_occ) + 1, nncf(j_occ) + ncf(j_occ)
+	      atom = icocc(lf)
+	      len = iorbs(atom)
+	      row = iused_t(atom) + 1
+	      cwork(row:row+len-1, 1) = cocc(base+pos+1:base+pos+len)
+	      pos = pos + len
+	    end do
+
+	    ! Pack each virtual column.
+	    do p = 1, nedges
+	      i_vir = i_list(p)
+	      col = p + 1
+	      base = ncvir(i_vir)
+	      pos = 0
+	      do le = nnce(i_vir) + 1, nnce(i_vir) + nce(i_vir)
+	        atom = icvir(le)
+	        len = iorbs(atom)
+	        row = iused_t(atom) + 1
+	        cwork(row:row+len-1, col) = cvir(base+pos+1:base+pos+len)
+	        pos = pos + len
+	      end do
+	    end do
+
+	    ! Compute initial Jacobi rotation parameters for each (j_occ, i_list(p)).
+	    do p = 1, nedges
+	      ij = edges(p)
+	      i_vir = i_list(p)
+	      if (tiny >= 0.d0) then
+	        if (Abs (fmo(ij)) < tiny) then
+	          alpha_vec(p) = 1.d0
+	          beta_vec(p) = 0.d0
+	          c_vec(p) = 0.d0
+	          cycle
+	        end if
+	      end if
+	      c = fmo(ij) * const
+	      d = eigs(j_occ) - eigv(i_vir) - shift
+	      if (biglim >= 0.d0) then
+	        if (d == 0.d0) then
+	          if (Abs (c) <= 0.d0) then
+	            alpha_vec(p) = 1.d0
+	            beta_vec(p) = 0.d0
+	            c_vec(p) = c
+	            cycle
+	          end if
+	        else if (Abs (c/d) < biglim) then
+	          alpha_vec(p) = 1.d0
+	          beta_vec(p) = 0.d0
+	          c_vec(p) = c
+	          cycle
+	        end if
+	      end if
+	      e = Sign (Sqrt (Max (0.d0, 4.d0*c*c + d*d)), d)
+	      if (e == 0.d0) then
+	        alpha = 1.d0
+	        beta = 0.d0
+	      else
+	        alpha = Sqrt (0.5d0*(1.d0 + d/e))
+	        beta = -Sign (Sqrt (Max (0.d0, 1.d0 - alpha*alpha)), c)
+	      end if
+	      alpha_vec(p) = alpha
+	      beta_vec(p) = beta
+	      c_vec(p) = c
+	    end do
+
+	    max_attempt = 1
+	    if (retry) max_attempt = 2
+	    ok = .false.
+	    do attempt = 1, max_attempt
+	      !
+	      ! Build U = product_p R_p (right-multiplication mixes columns 1 and p+1).
+	      !
+	      u_mat(:,:) = 0.d0
+	      do col = 1, ncols
+	        u_mat(col, col) = 1.d0
+	      end do
+	      do p = 1, nedges
+	        alpha = alpha_vec(p)
+	        beta = beta_vec(p)
+	        col = p + 1
+	        if (beta == 0.d0) cycle
+	        do q = 1, ncols
+	          u1 = u_mat(q, 1)
+	          up = u_mat(q, col)
+	          u_mat(q, 1) = alpha*u1 + beta*up
+	          u_mat(q, col) = -beta*u1 + alpha*up
+	        end do
+	      end do
+
+	      call dgemm ('N', 'N', m, ncols, ncols, 1.d0, cwork, size(cwork,1), &
+	           & u_mat, size(u_mat,1), 0.d0, cwork2, size(cwork2,1))
+
+	      !
+	      ! Capacity check for occupied + virtuals after applying threshold-based expansions.
+	      !
+	      ok = .true.
+
+	      ! Occupied bounds (same logic as process_pair).
+	      jlr = ncocc(j_occ) + 1
+	      if (j_occ /= nocc) then
+	        jur = ncocc(j_occ+1)
+	        jncf = nncf(j_occ+1)
+	      else
+	        jur = cocc_dim
+	        jncf = icocc_dim
+	      end if
+	      jur = Min (jlr+norbs-1, jur)
+
+	      add_atoms = 0
+	      add_len = 0
+	      do lf = nncf(j_occ) + 1, nncf(j_occ) + ncf(j_occ)
+	        latoms_t(icocc(lf)) = .true.
+	      end do
+	      do q = 1, nunion
+	        atom = atomwork(q)
+	        if (.not. latoms_t(atom)) then
+		          row = iused_t(atom) + 1
+		          len = iorbs(atom)
+		          norm2 = 0.d0
+		          do ao = 0, len - 1
+		            norm2 = norm2 + cwork2(row+ao, 1) ** 2
+		          end do
+		          if (norm2 > thresh) then
+		            add_atoms = add_atoms + 1
+		            add_len = add_len + len
+	          end if
+	        end if
+	      end do
+	      do q = 1, nunion
+	        latoms_t(atomwork(q)) = .false.
+	      end do
+		      ncf_new = ncf(j_occ) + add_atoms
+		      if (nncf(j_occ) + ncf_new > jncf) ok = .false.
+
+		      ! Coefficient capacity: current occupied used length is sum iorbs over its atom list.
+		      pos = 0
+		      do lf = nncf(j_occ) + 1, nncf(j_occ) + ncf(j_occ)
+	        pos = pos + iorbs(icocc(lf))
+	      end do
+	      if (ncocc(j_occ) + pos + add_len > jur) ok = .false.
+
+	      ! Virtual bounds.
+	      do p = 1, nedges
+	        i_vir = i_list(p)
+	        ilr = ncvir(i_vir) + 1
+	        if (i_vir /= nvir) then
+	          iur = ncvir(i_vir+1)
+	          incv = nnce(i_vir+1)
+	        else
+	          iur = cvir_dim
+	          incv = icvir_dim
+	        end if
+	        iur = Min (ilr+norbs-1, iur)
+
+	        add_atoms = 0
+	        add_len = 0
+	        do le = nnce(i_vir) + 1, nnce(i_vir) + nce(i_vir)
+	          latoms_t(icvir(le)) = .true.
+	        end do
+	        col = p + 1
+	        do q = 1, nunion
+	          atom = atomwork(q)
+	          if (.not. latoms_t(atom)) then
+		            row = iused_t(atom) + 1
+		            len = iorbs(atom)
+		            norm2 = 0.d0
+		            do ao = 0, len - 1
+		              norm2 = norm2 + cwork2(row+ao, col) ** 2
+		            end do
+		            if (norm2 > thresh) then
+		              add_atoms = add_atoms + 1
+		              add_len = add_len + len
+	            end if
+	          end if
+	        end do
+	        do q = 1, nunion
+	          latoms_t(atomwork(q)) = .false.
+	        end do
+	        nce_new = nce(i_vir) + add_atoms
+	        if (nnce(i_vir) + nce_new > incv) ok = .false.
+	        pos = 0
+	        do le = nnce(i_vir) + 1, nnce(i_vir) + nce(i_vir)
+	          pos = pos + iorbs(icvir(le))
+	        end do
+	        if (ncvir(i_vir) + pos + add_len > iur) ok = .false.
+	      end do
+
+	      if (ok) exit
+
+	      if (attempt < max_attempt) then
+	        ! Retry by damping each rotation angle (same rule as process_pair retry path).
+	        do p = 1, nedges
+	          alpha_vec(p) = 0.5d0 * (alpha_vec(p) + 1.d0)
+	          beta_vec(p) = -Sign (Sqrt (Max (0.d0, 1.d0 - alpha_vec(p)*alpha_vec(p))), c_vec(p))
+	        end do
+	      end if
+	    end do
+
+	    if (.not. ok) then
+	      goto 9000
+	    end if
+
+	    ! Accumulate the same rotation measure used in process_pair.
+	    do p = 1, nedges
+	      sumb_acc = sumb_acc + Abs (beta_vec(p))
+	    end do
+
+	    !
+	    ! Write back occupied coefficients, preserving atom order and appending new atoms by union order.
+	    !
+	    base = ncocc(j_occ)
+	    pos = 0
+	    do lf = nncf(j_occ) + 1, nncf(j_occ) + ncf(j_occ)
+	      atom = icocc(lf)
+	      len = iorbs(atom)
+	      row = iused_t(atom) + 1
+	      cocc(base+pos+1:base+pos+len) = cwork2(row:row+len-1, 1)
+	      pos = pos + len
+	      latoms_t(atom) = .true.
+	    end do
+	    do q = 1, nunion
+	      atom = atomwork(q)
+	      if (.not. latoms_t(atom)) then
+		        row = iused_t(atom) + 1
+		        len = iorbs(atom)
+		        norm2 = 0.d0
+		        do ao = 0, len - 1
+		          norm2 = norm2 + cwork2(row+ao, 1) ** 2
+		        end do
+		        if (norm2 > thresh) then
+		          ncf(j_occ) = ncf(j_occ) + 1
+		          icocc(nncf(j_occ)+ncf(j_occ)) = atom
+	          cocc(base+pos+1:base+pos+len) = cwork2(row:row+len-1, 1)
+	          pos = pos + len
+	          latoms_t(atom) = .true.
+	        end if
+	      end if
+	    end do
+	    do q = 1, nunion
+	      latoms_t(atomwork(q)) = .false.
+	    end do
+
+	    !
+	    ! Write back each virtual orbital.
+	    !
+	    do p = 1, nedges
+	      i_vir = i_list(p)
+	      col = p + 1
+	      base = ncvir(i_vir)
+	      pos = 0
+	      do le = nnce(i_vir) + 1, nnce(i_vir) + nce(i_vir)
+	        atom = icvir(le)
+	        len = iorbs(atom)
+	        row = iused_t(atom) + 1
+	        cvir(base+pos+1:base+pos+len) = cwork2(row:row+len-1, col)
+	        pos = pos + len
+	        latoms_t(atom) = .true.
+	      end do
+	      do q = 1, nunion
+	        atom = atomwork(q)
+	        if (.not. latoms_t(atom)) then
+		          row = iused_t(atom) + 1
+		          len = iorbs(atom)
+		          norm2 = 0.d0
+		          do ao = 0, len - 1
+		            norm2 = norm2 + cwork2(row+ao, col) ** 2
+		          end do
+		          if (norm2 > thresh) then
+		            nce(i_vir) = nce(i_vir) + 1
+		            icvir(nnce(i_vir)+nce(i_vir)) = atom
+	            cvir(base+pos+1:base+pos+len) = cwork2(row:row+len-1, col)
+	            pos = pos + len
+	            latoms_t(atom) = .true.
+	          end if
+	        end if
+	      end do
+	      do q = 1, nunion
+	        latoms_t(atomwork(q)) = .false.
+	      end do
+	    end do
+
+8000  continue
+	    ! Reset union markers (required before returning to scheduler).
+	    do q = 1, nunion
+	      iused_t(atomwork(q)) = -1
+	      latoms_t(atomwork(q)) = .false.
+	    end do
+	    return
+
+9000  continue
+	    ! Fall back to original per-pair kernel (includes retry/rollback behavior).
+	    do q = 1, nunion
+	      iused_t(atomwork(q)) = -1
+	      latoms_t(atomwork(q)) = .false.
+	    end do
+	    do p = 1, nedges
+	      call process_pair (edges(p), retry, tiny, biglim, sumb_acc, nrej_acc, iused_t, latoms_t, storei_t, storej_t)
+	    end do
+	    return
+
+	  end subroutine process_occ_block
+
 	  subroutine process_pair (ij, retry, tiny, biglim, sumb_acc, nrej_acc, iused_t, latoms_t, storei_t, storej_t)
     integer, intent (in) :: ij
     logical, intent (in) :: retry
