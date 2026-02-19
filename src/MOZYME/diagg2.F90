@@ -58,7 +58,7 @@
 	    double precision, parameter :: tune_alpha = 0.25d0, tune_switch_margin = 1.02d0
 	    integer, parameter :: tune_explore_period = 24
 	    integer :: alloc_stat, max_threads, tid, diagg2_threads, width_hint
-	    integer :: lvl, max_level, nactive, pos
+	    integer :: lvl, max_level, max_level_est, nactive, pos
 	    integer :: batch_start, batch_end, batch_target, batch_edges
 	    integer :: batch_min, batch_max
 	    integer :: i_task, j_task
@@ -227,70 +227,33 @@
 
 	        if (nactive > 0) then
 	          !
-	          ! Eq. (D1): level schedule by repeated maximal matching.
-	          ! Each level k is a matching M_k (no repeated occupied/virtual indices).
-	          ! This reduces barrier depth vs. strict edge-order list scheduling.
+	          ! Eq. (D0): one-pass level-depth estimate
+	          !   l(e_k) = 1 + max(last_occ(j_k), last_vir(i_k))
+	          ! gives an upper bound for schedule depth at O(nactive) cost.
+	          ! Used for thread-width and mode selection before deciding whether
+	          ! the full repeated-maximal-matching schedule is required.
 	          !
 	          last_occ(:) = 0
 	          last_vir(:) = 0
-	          rem_edges(1:nactive) = active_edges(1:nactive)
-	          nrem = nactive
-	          max_level = 0
-	          do while (nrem > 0)
-	            max_level = max_level + 1
-	            nnext = 0
-	            do iedge = 1, nrem
-	              ij = rem_edges(iedge)
-	              i = ifmo(1, ij)
-	              j = ifmo(2, ij)
-	              if (last_occ(j) == max_level .or. last_vir(i) == max_level) then
-	                nnext = nnext + 1
-	                next_edges(nnext) = ij
-	              else
-	                edge_level(ij) = max_level
-	                last_occ(j) = max_level
-	                last_vir(i) = max_level
-	              end if
-	            end do
-	            if (nnext > 0) rem_edges(1:nnext) = next_edges(1:nnext)
-	            nrem = nnext
+	          max_level_est = 0
+	          do iedge = 1, nactive
+	            ij = active_edges(iedge)
+	            i = ifmo(1, ij)
+	            j = ifmo(2, ij)
+	            lvl = Max (last_occ(j), last_vir(i)) + 1
+	            last_occ(j) = lvl
+	            last_vir(i) = lvl
+	            max_level_est = Max (max_level_est, lvl)
 	          end do
-	
-	          allocate (level_count(max_level), level_offset(max_level+1), level_pos(max_level), &
-	               & level_edges(nactive), stat=alloc_stat)
-	          if (alloc_stat /= 0) then
-	            call mopend("Insufficient memory to run DIAGG2 (parallel scheduling)")
-	            use_parallel_diagg2 = .false.
-	          else
-	            level_count(:) = 0
-	            do iedge = 1, nactive
-	              ij = active_edges(iedge)
-	              lvl = edge_level(ij)
-	              level_count(lvl) = level_count(lvl) + 1
-	            end do
 
-            level_offset(1) = 1
-            do lvl = 1, max_level
-              level_offset(lvl+1) = level_offset(lvl) + level_count(lvl)
-            end do
+	            ! Previous-commit improvement kept here: adaptive team sizing from level width.
+	            ! Eq. (0): width_hint = ceil(nactive / max_level_est)
+	            !         diagg2_threads = min(max_threads, 2*width_hint, nactive)
+	            width_hint = Max (1, (nactive + max_level_est - 1) / max_level_est)
+	            diagg2_threads = Min (max_threads, Max (1, 2 * width_hint))
+	            diagg2_threads = Min (diagg2_threads, nactive)
 
-	            level_pos(:) = level_offset(1:max_level)
-	            do iedge = 1, nactive
-	              ij = active_edges(iedge)
-	              lvl = edge_level(ij)
-	              pos = level_pos(lvl)
-	              level_edges(pos) = ij
-	              level_pos(lvl) = pos + 1
-	            end do
-
-		            ! Previous-commit improvement kept here: adaptive team sizing from level width.
-		            ! Eq. (0): width_hint = ceil(nactive / max_level)
-		            !         diagg2_threads = min(max_threads, 2*width_hint, nactive)
-		            width_hint = Max (1, (nactive + max_level - 1) / max_level)
-		            diagg2_threads = Min (max_threads, Max (1, 2 * width_hint))
-		            diagg2_threads = Min (diagg2_threads, nactive)
-
-		            if (diagg2_threads > 1) then
+	            if (diagg2_threads > 1) then
 		              occ_span_max = 1
 		              do j = 1, nocc
 		                jlr = ncocc(j) + 1
@@ -334,13 +297,20 @@
 	                if (allocated(storej_ws)) deallocate (storej_ws)
 
 		                ! Scratch footprint scales as O((numat + span_occ + span_vir)*threads), reused.
-		                allocate (iused_ws(numat, diagg2_threads), latoms_ws(numat, diagg2_threads), &
-		                     & storei_ws(vir_span_max, diagg2_threads), &
-		                     & storej_ws(occ_span_max, diagg2_threads), stat=alloc_stat)
-		                if (alloc_stat /= 0) then
-		                  call mopend("Insufficient memory to run DIAGG2 (parallel scratch workspace)")
-		                end if
-		              end if
+	                allocate (iused_ws(numat, diagg2_threads), latoms_ws(numat, diagg2_threads), &
+	                     & storei_ws(vir_span_max, diagg2_threads), &
+	                     & storej_ws(occ_span_max, diagg2_threads), stat=alloc_stat)
+	                if (alloc_stat /= 0) then
+	                  call mopend("Insufficient memory to run DIAGG2 (parallel scratch workspace)")
+	                end if
+	                !
+	                ! Eq. (D3): initialize thread-local marker state once per (re)allocation.
+	                ! Per-pair sparse resets keep markers clean, so we avoid O(numat*threads)
+	                ! full clears at each DIAGG2 call.
+	                !
+	                iused_ws(:, :) = -1
+	                latoms_ws(:, :) = .false.
+	              end if
 
 	              if (.not. allocated(tune_calls) .or. size(tune_calls) < max_threads) then
 	                if (allocated(tune_calls)) deallocate (tune_calls)
@@ -384,7 +354,7 @@
 
 	              tune_calls(tune_slot) = tune_calls(tune_slot) + 1
 	              tune_calls_slot = tune_calls(tune_slot)
-	              task_capable = (max_level > 1 .and. nactive >= 2*diagg2_threads)
+	              task_capable = (max_level_est > 1 .and. nactive >= 2*diagg2_threads)
 	              mode_selected = mode_level
 
 	              if (task_capable) then
@@ -434,9 +404,7 @@
 		                t_start = omp_get_wtime()
 !$omp parallel num_threads(diagg2_threads) default(shared) &
 !$omp& private(ij, pos, tid, i_task, j_task, batch_start, batch_end)
-		                tid = omp_get_thread_num() + 1
-		                iused_ws(:, tid) = -1
-		                latoms_ws(:, tid) = .false.
+	                tid = omp_get_thread_num() + 1
 !$omp single
 		                batch_start = 1
 		                do while (batch_start <= nactive)
@@ -455,9 +423,14 @@
 		                         & iused_ws(:,tid), latoms_ws(:,tid), storei_ws(:,tid), storej_ws(:,tid))
 !$omp end task
 		                  end do
-!$omp taskwait
 		                  batch_start = batch_end + 1
 	                end do
+		                !
+		                ! Eq. (D4): one synchronization per task sweep.
+		                ! Dependencies already serialize conflicting (i,j) updates,
+		                ! so waiting once avoids O(nbatch) barrier overhead.
+		                !
+!$omp taskwait
 !$omp end single
 !$omp end parallel
 	                elapsed = Max (1.d-12, omp_get_wtime() - t_start)
@@ -491,14 +464,73 @@
 	                end do
 	                deallocate (sumb_thread, nrej_thread)
 	              else
+	                !
+	                ! Eq. (D1): build exact level schedule only when level mode is selected.
+	                ! Repeated maximal matchings M_k satisfy:
+	                !   e=(i,j) in M_k => i and j are unique within level k.
+	                ! This preserves conflict-free pair rotations in each level.
+	                !
+	                edge_level(:) = 0
+	                last_occ(:) = 0
+	                last_vir(:) = 0
+	                rem_edges(1:nactive) = active_edges(1:nactive)
+	                nrem = nactive
+	                max_level = 0
+	                do while (nrem > 0)
+	                  max_level = max_level + 1
+	                  nnext = 0
+	                  do iedge = 1, nrem
+	                    ij = rem_edges(iedge)
+	                    i = ifmo(1, ij)
+	                    j = ifmo(2, ij)
+	                    if (last_occ(j) == max_level .or. last_vir(i) == max_level) then
+	                      nnext = nnext + 1
+	                      next_edges(nnext) = ij
+	                    else
+	                      edge_level(ij) = max_level
+	                      last_occ(j) = max_level
+	                      last_vir(i) = max_level
+	                    end if
+	                  end do
+	                  if (nnext > 0) rem_edges(1:nnext) = next_edges(1:nnext)
+	                  nrem = nnext
+	                end do
+
+	                if (allocated(level_count)) deallocate (level_count)
+	                if (allocated(level_offset)) deallocate (level_offset)
+	                if (allocated(level_pos)) deallocate (level_pos)
+	                if (allocated(level_edges)) deallocate (level_edges)
+	                allocate (level_count(max_level), level_offset(max_level+1), level_pos(max_level), &
+	                     & level_edges(nactive), stat=alloc_stat)
+	                if (alloc_stat /= 0) then
+	                  call mopend("Insufficient memory to run DIAGG2 (level schedule)")
+	                end if
+
+	                level_count(:) = 0
+	                do iedge = 1, nactive
+	                  ij = active_edges(iedge)
+	                  lvl = edge_level(ij)
+	                  level_count(lvl) = level_count(lvl) + 1
+	                end do
+	                level_offset(1) = 1
+	                do lvl = 1, max_level
+	                  level_offset(lvl+1) = level_offset(lvl) + level_count(lvl)
+	                end do
+	                level_pos(:) = level_offset(1:max_level)
+	                do iedge = 1, nactive
+	                  ij = active_edges(iedge)
+	                  lvl = edge_level(ij)
+	                  pos = level_pos(lvl)
+	                  level_edges(pos) = ij
+	                  level_pos(lvl) = pos + 1
+	                end do
+
 	                sumb_local = 0.d0
 	                nrej_local = 0
 	                t_start = omp_get_wtime()
 !$omp parallel num_threads(diagg2_threads) default(shared) private(ij, lvl, pos, tid) &
 !$omp& reduction(+:sumb_local, nrej_local)
 	                tid = omp_get_thread_num() + 1
-	                iused_ws(:, tid) = -1
-	                latoms_ws(:, tid) = .false.
 
 	                do lvl = 1, max_level
 !$omp do schedule(dynamic,16)
@@ -528,13 +560,15 @@
 		              use_parallel_diagg2 = .false.
 		            end if
 
-		            deallocate (level_edges, level_pos, level_offset, level_count)
+		            if (allocated(level_edges)) deallocate (level_edges)
+		            if (allocated(level_pos)) deallocate (level_pos)
+		            if (allocated(level_offset)) deallocate (level_offset)
+		            if (allocated(level_count)) deallocate (level_count)
 	          end if
 	        end if
 
 	        deallocate (edge_level, active_edges, rem_edges, next_edges, last_occ, last_vir)
 	      end if
-	    end if
 #endif
 
     if (.not. use_parallel_diagg2) then
@@ -574,10 +608,22 @@
 	              incv = icvir_dim
 	            end if
 	            iur = Min (ilr+norbs-1, iur)
-	            njlen = jur - jlr + 1
-	            nilen = iur - ilr + 1
-	            storej(1:njlen) = cocc(jlr:jur)
-	            storei(1:nilen) = cvir(ilr:iur)
+	            !
+	            ! Eq. (E2): rollback backups need only the currently populated
+	            ! coefficient spans (not the full reserved windows).
+	            !   n_j = Sum_{a in supp(occ_j)} n_AO(a)
+	            !   n_i = Sum_{a in supp(vir_i)} n_AO(a)
+	            !
+	            njlen = 0
+	            do lf = nncf(j) + 1, nncf(j) + ncf(j)
+	              njlen = njlen + iorbs(icocc(lf))
+	            end do
+	            nilen = 0
+	            do le = nnce(i) + 1, nnce(i) + nce(i)
+	              nilen = nilen + iorbs(icvir(le))
+	            end do
+	            storej(1:njlen) = cocc(jlr:jlr+njlen-1)
+	            storei(1:nilen) = cvir(ilr:ilr+nilen-1)
             !
             !   STORAGE DONE.
             !
@@ -700,14 +746,16 @@
                 !   TO PREVENT THIS, RESET THE LMOS.
                 !
 	              ! Previous-commit improvement kept here: contiguous slice rollback replaces scalar loops.
-	              cocc(jlr:jur) = storej(1:njlen)
-	              cvir(ilr:iur) = storei(1:nilen)
-              ncf(j) = ncfj
-              nce(i) = ncei
-              do k = 1, numat
-                iused(k) = -1
-                latoms(k) = .false.
-              end do
+	              cocc(jlr:jlr+njlen-1) = storej(1:njlen)
+	              cvir(ilr:ilr+nilen-1) = storei(1:nilen)
+	              do le = nnce(i) + 1, nnce(i) + nce(i)
+	                latoms(icvir(le)) = .false.
+	              end do
+	              do lf = nncf(j) + 1, nncf(j) + ncf(j)
+	                iused(icocc(lf)) = -1
+	              end do
+	              ncf(j) = ncfj
+	              nce(i) = ncei
               if (retry) then
                   !
                   !   HALF THE ROTATION ANGLE.  WILL THIS PREVENT THE
@@ -796,8 +844,20 @@
       incv = icvir_dim
     end if
 	    iur = Min (ilr+norbs-1, iur)
-	    njlen = jur - jlr + 1
-	    nilen = iur - ilr + 1
+	    !
+	    ! Eq. (E2): backup sizes are active LMO support lengths:
+	    !   n_j = Sum_{a in supp(occ_j)} n_AO(a), n_i = Sum_{a in supp(vir_i)} n_AO(a)
+	    ! This lowers rollback copy traffic while keeping the same pre-rotation
+	    ! state for all currently populated coefficients.
+	    !
+	    njlen = 0
+	    do lf = nncf(j) + 1, nncf(j) + ncf(j)
+	      njlen = njlen + iorbs(icocc(lf))
+	    end do
+	    nilen = 0
+	    do le = nnce(i) + 1, nnce(i) + nce(i)
+	      nilen = nilen + iorbs(icvir(le))
+	    end do
 	    !
 	    ! Safety guard: required backup lengths must satisfy
 	    !   njlen <= size(storej_t), nilen <= size(storei_t)
@@ -808,8 +868,8 @@
 	      return
 	    end if
 	    ! Previous-commit improvement kept here: contiguous backup copy for rollback path.
-	    storej_t(1:njlen) = cocc(jlr:jur)
-	    storei_t(1:nilen) = cvir(ilr:iur)
+	    storej_t(1:njlen) = cocc(jlr:jlr+njlen-1)
+	    storei_t(1:nilen) = cvir(ilr:ilr+nilen-1)
     !
     !   STORAGE DONE.
     !
@@ -889,12 +949,16 @@
         ! Rejected due to array bounds in occupied expansion.
         nrej_acc = nrej_acc + 1
         ! Contiguous restore (same values as pre-rotation state).
-        cocc(jlr:jur) = storej_t(1:njlen)
-        cvir(ilr:iur) = storei_t(1:nilen)
-        ncf(j) = ncfj
-        nce(i) = ncei
-        iused_t(:) = -1
-        latoms_t(:) = .false.
+	        cocc(jlr:jlr+njlen-1) = storej_t(1:njlen)
+	        cvir(ilr:ilr+nilen-1) = storei_t(1:nilen)
+	        do le = nnce(i) + 1, nnce(i) + nce(i)
+	          latoms_t(icvir(le)) = .false.
+	        end do
+	        do lf = nncf(j) + 1, nncf(j) + ncf(j)
+	          iused_t(icocc(lf)) = -1
+	        end do
+	        ncf(j) = ncfj
+	        nce(i) = ncei
         if (retry) then
           alpha = 0.5d0 * (alpha+1.d0)
           cycle
@@ -941,12 +1005,16 @@
         ! Rejected due to array bounds in virtual expansion.
         nrej_acc = nrej_acc + 1
         ! Contiguous restore (same values as pre-rotation state).
-        cocc(jlr:jur) = storej_t(1:njlen)
-        cvir(ilr:iur) = storei_t(1:nilen)
-        ncf(j) = ncfj
-        nce(i) = ncei
-        iused_t(:) = -1
-        latoms_t(:) = .false.
+	        cocc(jlr:jlr+njlen-1) = storej_t(1:njlen)
+	        cvir(ilr:ilr+nilen-1) = storei_t(1:nilen)
+	        do le = nnce(i) + 1, nnce(i) + nce(i)
+	          latoms_t(icvir(le)) = .false.
+	        end do
+	        do lf = nncf(j) + 1, nncf(j) + ncf(j)
+	          iused_t(icocc(lf)) = -1
+	        end do
+	        ncf(j) = ncfj
+	        nce(i) = ncei
         if (retry) then
           alpha = 0.5d0 * (alpha+1.d0)
           cycle
