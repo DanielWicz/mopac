@@ -196,11 +196,13 @@ subroutine density_for_MOZYME (p, mode, nclose_loc, partp)
 !$omp end do
 !$omp end parallel
 
-!$omp parallel do schedule(static) private(tid)
+!$omp parallel do schedule(static) private(tid, sum)
       do l = 1, mpack
+        sum = 0.d0
         do tid = 1, nthreads_used
-          p(l) = p(l) + p_thread(l, tid)
+          sum = sum + p_thread(l, tid)
         end do
+        p(l) = p(l) + sum
       end do
 !$omp end parallel do
     else

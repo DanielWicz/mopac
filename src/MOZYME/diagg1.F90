@@ -754,159 +754,160 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
 		  end subroutine buffer_append
 #endif
 			  subroutine build_virtual (i, prev_i, ws, latoms, avir, aov, cutoff)
-			    integer, intent (in) :: i
-			    integer, intent (in) :: prev_i
-			    double precision, dimension (norbs), intent (inout) :: ws
-			    logical, dimension (numat), intent (inout) :: latoms
-			    double precision, dimension (numat), intent (inout) :: avir, aov
-		    double precision, intent (in) :: cutoff
-		    integer :: loopi, l, j, j1, jx, k, k1, kk, kj, kl, ii, i4
-		    double precision :: sum
+    integer, intent (in) :: i
+    integer, intent (in) :: prev_i
+    double precision, dimension (norbs), intent (inout) :: ws
+    logical, dimension (numat), intent (inout) :: latoms
+    double precision, dimension (numat), intent (inout) :: avir, aov
+    double precision, intent (in) :: cutoff
+    integer :: loopi, l, j, j1, jx, k, k1, kk, kj, kl, jl, ii, i4
+    double precision :: sum, f_val, p_val
+    integer :: v_off(nce(i))
 
-		    loopi = ncvir(i)
-		    if (prev_i > 0) then
-		      do j = nnce(prev_i) + 1, nnce(prev_i) + nce(prev_i)
-		        j1 = icvir(j)
-		        latoms(j1) = .false.
-		      end do
-		    else
-		      latoms(:) = .false.
-		    end if
-		    l = 0
-		    do j = nnce(i) + 1, nnce(i) + nce(i)
-		      j1 = icvir(j)
-		      sum = 0.d0
-	      do k = l + 1, l + iorbs(j1)
-	        sum = sum + cvir(k+loopi) ** 2
-	      end do
-	      l = l + iorbs(j1)
-	      avir(j1) = sum
-	      latoms(icvir(j)) = .true.
-	    end do
+    loopi = ncvir(i)
+    if (prev_i > 0) then
+      do j = nnce(prev_i) + 1, nnce(prev_i) + nce(prev_i)
+        j1 = icvir(j)
+        latoms(j1) = .false.
+      end do
+    else
+      latoms(:) = .false.
+    end if
+    
+    l = 0
+    do j = 1, nce(i)
+      j1 = icvir(nnce(i)+j)
+      sum = 0.d0
+      v_off(j) = l + loopi
+      do k = l + 1, l + iorbs(j1)
+        sum = sum + cvir(k+loopi) ** 2
+      end do
+      l = l + iorbs(j1)
+      avir(j1) = sum
+      latoms(j1) = .true.
+      do jx = 1, iorbs(j1)
+        ws(nfirst(j1)+jx-1) = 0.0d00
+      end do
+    end do
 
-	    if (lijbo) then
-	      do j = nnce(i) + 1, nnce(i) + nce(i)
-	        j1 = icvir(j)
-	        do jx = 1, iorbs(j1)
-	          ws(nfirst(j1)+jx-1) = 0.0d00
-	        end do
-	        kl = loopi
-	        do kk = nnce(i) + 1, nnce(i) + nce(i)
-	          k1 = icvir(kk)
-	          kj = nijbo(k1, j1)
-	          if (kj >= 0) then
-	            if (avir(k1)*p(kj+1) > cutoff) then
-	              if (iorbs(k1) == 1 .and. iorbs(j1) == 1) then
-	                ws(nfirst(j1)) = ws(nfirst(j1)) + fao(kj+1) * cvir(kl+1)
-	              else
-	                if (k1 > j1) then
-	                  ii = kj
-	                  do i4 = 1, iorbs(k1)
-	                    do jx = 1, iorbs(j1)
-	                      ii = ii + 1
-	                      ws(nfirst(j1)+jx-1) = ws(nfirst(j1)+jx-1) + fao(ii) * cvir(kl+i4)
-	                    end do
-	                  end do
-	                else if (k1 < j1) then
-	                  ii = kj
-	                  do jx = 1, iorbs(j1)
-	                    do i4 = 1, iorbs(k1)
-	                      ii = ii + 1
-	                      ws(nfirst(j1)+jx-1) = ws(nfirst(j1)+jx-1) + fao(ii) * cvir(kl+i4)
-	                    end do
-	                  end do
-	                else
-	                  do jx = 1, iorbs(j1)
-	                    do i4 = 1, iorbs(j1)
-	                      if (i4 > jx) then
-	                        ii = kj + (i4*(i4-1)) / 2 + jx
-	                      else
-	                        ii = kj + (jx*(jx-1)) / 2 + i4
-	                      end if
-	                      ws(nfirst(j1)+jx-1) = ws(nfirst(j1)+jx-1) + fao(ii) * cvir(kl+i4)
-	                    end do
-	                  end do
-	                end if
-	              end if
-	            end if
-	          end if
-	          kl = kl + iorbs(k1)
-	        end do
-	      end do
-	    else
-	      do j = nnce(i) + 1, nnce(i) + nce(i)
-	        j1 = icvir(j)
-	        do jx = 1, iorbs(j1)
-	          ws(nfirst(j1)+jx-1) = 0.0d00
-	        end do
-	        kl = loopi
-	        do kk = nnce(i) + 1, nnce(i) + nce(i)
-	          k1 = icvir(kk)
-	          kj = ijbo (k1, j1)
-	          if (kj >= 0) then
-	            if (avir(k1)*p(kj+1) > cutoff) then
-	              if (iorbs(k1) == 1 .and. iorbs(j1) == 1) then
-	                ws(nfirst(j1)) = ws(nfirst(j1)) + fao(kj+1) * cvir(kl+1)
-	              else
-	                if (k1 > j1) then
-	                  ii = kj
-	                  do i4 = 1, iorbs(k1)
-	                    do jx = 1, iorbs(j1)
-	                      ii = ii + 1
-	                      ws(nfirst(j1)+jx-1) = ws(nfirst(j1)+jx-1) + fao(ii) * cvir(kl+i4)
-	                    end do
-	                  end do
-	                else if (k1 < j1) then
-	                  ii = kj
-	                  do jx = 1, iorbs(j1)
-	                    do i4 = 1, iorbs(k1)
-	                      ii = ii + 1
-	                      ws(nfirst(j1)+jx-1) = ws(nfirst(j1)+jx-1) + fao(ii) * cvir(kl+i4)
-	                    end do
-	                  end do
-	                else
-	                  do jx = 1, iorbs(j1)
-	                    do i4 = 1, iorbs(j1)
-	                      if (i4 > jx) then
-	                        ii = kj + (i4*(i4-1)) / 2 + jx
-	                      else
-	                        ii = kj + (jx*(jx-1)) / 2 + i4
-	                      end if
-	                      ws(nfirst(j1)+jx-1) = ws(nfirst(j1)+jx-1) + fao(ii) * cvir(kl+i4)
-	                    end do
-	                  end do
-	                end if
-	              end if
-	            end if
-	          end if
-	          kl = kl + iorbs(k1)
-	        end do
-	      end do
-		    end if
-		    do j = nnce(i) + 1, nnce(i) + nce(i)
-		      j1 = icvir(j)
-		      sum = 0.d0
-		      do k = nfirst(j1), nlast(j1)
-		        sum = sum + ws(k) ** 2
-		      end do
-		      aov(j1) = sum
-		    end do
+    if (lijbo) then
+      do kk = 1, nce(i)
+        k1 = icvir(nnce(i)+kk)
+        kl = v_off(kk)
+        do j = 1, nce(i)
+          j1 = icvir(nnce(i)+j)
+          kj = nijbo(k1, j1)
+          if (kj >= 0) then
+            if (avir(k1)*p(kj+1) > cutoff) then
+              if (iorbs(k1) == 1 .and. iorbs(j1) == 1) then
+                ws(nfirst(j1)) = ws(nfirst(j1)) + fao(kj+1) * cvir(kl+1)
+              else
+                if (k1 > j1) then
+                  ii = kj
+                  do i4 = 1, iorbs(k1)
+                    f_val = cvir(kl+i4)
+                    do jx = 1, iorbs(j1)
+                      ii = ii + 1
+                      ws(nfirst(j1)+jx-1) = ws(nfirst(j1)+jx-1) + fao(ii) * f_val
+                    end do
+                  end do
+                else if (k1 < j1) then
+                  ii = kj
+                  do jx = 1, iorbs(j1)
+                    do i4 = 1, iorbs(k1)
+                      ii = ii + 1
+                      ws(nfirst(j1)+jx-1) = ws(nfirst(j1)+jx-1) + fao(ii) * cvir(kl+i4)
+                    end do
+                  end do
+                else
+                  do jx = 1, iorbs(j1)
+                    do i4 = 1, iorbs(j1)
+                      if (i4 > jx) then
+                        ii = kj + (i4*(i4-1)) / 2 + jx
+                      else
+                        ii = kj + (jx*(jx-1)) / 2 + i4
+                      end if
+                      ws(nfirst(j1)+jx-1) = ws(nfirst(j1)+jx-1) + fao(ii) * cvir(kl+i4)
+                    end do
+                  end do
+                end if
+              end if
+            end if
+          end if
+        end do
+      end do
+    else
+      do kk = 1, nce(i)
+        k1 = icvir(nnce(i)+kk)
+        kl = v_off(kk)
+        do j = 1, nce(i)
+          j1 = icvir(nnce(i)+j)
+          kj = ijbo (k1, j1)
+          if (kj >= 0) then
+            if (avir(k1)*p(kj+1) > cutoff) then
+              if (iorbs(k1) == 1 .and. iorbs(j1) == 1) then
+                ws(nfirst(j1)) = ws(nfirst(j1)) + fao(kj+1) * cvir(kl+1)
+              else
+                if (k1 > j1) then
+                  ii = kj
+                  do i4 = 1, iorbs(k1)
+                    f_val = cvir(kl+i4)
+                    do jx = 1, iorbs(j1)
+                      ii = ii + 1
+                      ws(nfirst(j1)+jx-1) = ws(nfirst(j1)+jx-1) + fao(ii) * f_val
+                    end do
+                  end do
+                else if (k1 < j1) then
+                  ii = kj
+                  do jx = 1, iorbs(j1)
+                    do i4 = 1, iorbs(k1)
+                      ii = ii + 1
+                      ws(nfirst(j1)+jx-1) = ws(nfirst(j1)+jx-1) + fao(ii) * cvir(kl+i4)
+                    end do
+                  end do
+                else
+                  do jx = 1, iorbs(j1)
+                    do i4 = 1, iorbs(j1)
+                      if (i4 > jx) then
+                        ii = kj + (i4*(i4-1)) / 2 + jx
+                      else
+                        ii = kj + (jx*(jx-1)) / 2 + i4
+                      end if
+                      ws(nfirst(j1)+jx-1) = ws(nfirst(j1)+jx-1) + fao(ii) * cvir(kl+i4)
+                    end do
+                  end do
+                end if
+              end if
+            end if
+          end if
+        end do
+      end do
+    end if
 
-		    sum = 0.d0
-		    kl = loopi
-		    do kk = nnce(i) + 1, nnce(i) + nce(i)
-	      k1 = icvir(kk)
-	      if (aov(k1)*avir(k1) > cutoff) then
-	        do k = nfirst(k1), nlast(k1)
-	          kl = kl + 1
-	          sum = sum + ws(k) * cvir(kl)
-	        end do
-	      else
-	        kl = kl + iorbs(k1)
-	      end if
-	    end do
-		    eigv(i) = sum
-		  end subroutine build_virtual
+    do j = nnce(i) + 1, nnce(i) + nce(i)
+      j1 = icvir(j)
+      sum = 0.d0
+      do k = nfirst(j1), nlast(j1)
+        sum = sum + ws(k) ** 2
+      end do
+      aov(j1) = sum
+    end do
+
+    sum = 0.d0
+    kl = loopi
+    do kk = nnce(i) + 1, nnce(i) + nce(i)
+      k1 = icvir(kk)
+      if (aov(k1)*avir(k1) > cutoff) then
+        do k = nfirst(k1), nlast(k1)
+          kl = kl + 1
+          sum = sum + ws(k) * cvir(kl)
+        end do
+      else
+        kl = kl + iorbs(k1)
+      end if
+    end do
+    eigv(i) = sum
+  end subroutine build_virtual
 
 		  subroutine build_occupied_energy (i, avir_occ, cutoff)
 		    integer, intent (in) :: i

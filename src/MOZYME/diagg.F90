@@ -27,19 +27,23 @@ subroutine diagg (fao, nocc, nvir, idiagg, partp, indi)
 !
     implicit none
     integer, intent (in) :: idiagg, nocc, nvir, indi
+    double precision, allocatable, save :: storei_ws(:), storej_ws(:), ws_ws(:), aov_ws(:), avir_ws(:), aocc_ws(:)
+    integer, allocatable, save :: iused_ws(:)
+    logical, allocatable, save :: latoms_ws(:)
+
     double precision, dimension (mpack), intent (inout) :: partp
     double precision, dimension (mpack), intent (in) :: fao
 !
     integer :: nij, alloc_stat
-    logical, dimension (:), allocatable :: latoms
-    integer, dimension (:), allocatable :: iused
-    double precision, dimension(:), allocatable :: storei, storej, ws, aov, aocc, avir
-    allocate (storei(norbs), storej(norbs), ws(norbs), aov(numat), &
-         & avir(norbs), aocc(Max(1, icocc_dim)), iused(numat), latoms(numat), &
-         & stat=alloc_stat)
-    if (alloc_stat /= 0) then
-      call mopend("Insufficient memory to run DIAGG")
-      return
+                    if (.not. allocated(storei_ws) .or. size(storei_ws) < norbs) then
+      if (allocated(storei_ws)) deallocate (storei_ws, storej_ws, ws_ws, aov_ws, avir_ws, aocc_ws, iused_ws, latoms_ws)
+      allocate (storei_ws(norbs), storej_ws(norbs), ws_ws(norbs), aov_ws(numat), &
+           & avir_ws(norbs), aocc_ws(Max(1, icocc_dim)), iused_ws(numat), latoms_ws(numat), &
+           & stat=alloc_stat)
+      if (alloc_stat /= 0) then
+        call mopend("Insufficient memory to run DIAGG")
+        return
+      end if
     end if
     nij = fmo_dim
 !**********************************************************************
@@ -50,8 +54,8 @@ subroutine diagg (fao, nocc, nvir, idiagg, partp, indi)
 !**********************************************************************
 
 !
-    call diagg1 (fao, nocc, nvir,  eigs(nocc+1:), ws, latoms,  ifmo, fmo, &
-     & fmo_dim, nij, idiagg, avir, aocc, aov)
+    call diagg1 (fao, nocc, nvir,  eigs(nocc+1:), ws_ws, latoms_ws,  ifmo, fmo, &
+     & fmo_dim, nij, idiagg, avir_ws, aocc_ws, aov_ws)
 !
 !**********************************************************************
 !
@@ -60,10 +64,9 @@ subroutine diagg (fao, nocc, nvir, idiagg, partp, indi)
 !
 !**********************************************************************
 
-    call diagg2 (nocc, nvir, eigs(nocc+1:), iused, latoms, nij, idiagg, storei, storej)
+    call diagg2 (nocc, nvir, eigs(nocc+1:), iused_ws, latoms_ws, nij, idiagg, storei_ws, storej_ws)
 !
     call density_for_MOZYME (p, indi, nocc, partp)
 !
-    deallocate (storei, storej, ws, aov, avir, aocc, iused, latoms)
-    return
+        return
 end subroutine diagg
