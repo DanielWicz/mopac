@@ -1,3 +1,8 @@
+module mozyme_bsr_mod
+  implicit none
+  integer, allocatable, save :: bsr_rowptr(:), bsr_colind(:), bsr_fao_idx(:)
+end module mozyme_bsr_mod
+
 ! Molecular Orbital PACkage (MOPAC)
 ! Copyright 2021 Virginia Polytechnic Institute and State University
 !
@@ -35,8 +40,9 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
    !
    !**********************************************************************
    !
-	    use molkst_C, only: numat, norbs, mpack, numcal, keywrd
-	    use MOZYME_C, only : nvirtual, icocc_dim, &
+	                            use molkst_C, only: numat, norbs, mpack, numcal, keywrd
+	                            use mozyme_bsr_mod
+	                            use MOZYME_C, only : nvirtual, icocc_dim, &
 	       & nfmo, lijbo, nijbo, &
 	       tiny, sumt, ijc, ovmax, ncf, nce, nncf, nnce, ncocc, ncvir, &
 	     & iorbs, icocc, icvir, cocc, cvir
@@ -98,6 +104,69 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
     !
     aocc(:) = 0.d0
     !
+    ! BSR CONSTRUCTION
+    if (.not. allocated(bsr_rowptr) .or. size(bsr_rowptr) < numat + 2) then
+        if (allocated(bsr_rowptr)) deallocate(bsr_rowptr, bsr_colind, bsr_fao_idx)
+        allocate(bsr_rowptr(numat + 2))
+    end if
+    
+    block
+      integer :: ptr_bsr, nnz_blocks
+      integer, allocatable :: row_counts(:)
+      allocate(row_counts(numat))
+!$omp parallel do schedule(static)
+      do j1 = 1, numat
+          row_counts(j1) = 0
+          if (lijbo) then
+              do k1 = 1, numat
+                  if (nijbo(k1, j1) >= 0) row_counts(j1) = row_counts(j1) + 1
+              end do
+          else
+              do k1 = 1, numat
+                  if (ijbo(k1, j1) >= 0) row_counts(j1) = row_counts(j1) + 1
+              end do
+          end if
+      end do
+!$omp end parallel do
+
+      bsr_rowptr(1) = 1
+      do j1 = 1, numat
+          bsr_rowptr(j1+1) = bsr_rowptr(j1) + row_counts(j1)
+      end do
+      nnz_blocks = bsr_rowptr(numat+1) - 1
+      
+      if (.not. allocated(bsr_colind) .or. size(bsr_colind) < nnz_blocks) then
+          if (allocated(bsr_colind)) deallocate(bsr_colind, bsr_fao_idx)
+          allocate(bsr_colind(nnz_blocks), bsr_fao_idx(nnz_blocks))
+      end if
+      
+!$omp parallel do schedule(static) private(ptr_bsr, kj)
+      do j1 = 1, numat
+          ptr_bsr = bsr_rowptr(j1)
+          if (lijbo) then
+              do k1 = 1, numat
+                  kj = nijbo(k1, j1)
+                  if (kj >= 0) then
+                      bsr_colind(ptr_bsr) = k1
+                      bsr_fao_idx(ptr_bsr) = kj
+                      ptr_bsr = ptr_bsr + 1
+                  end if
+              end do
+          else
+              do k1 = 1, numat
+                  kj = ijbo(k1, j1)
+                  if (kj >= 0) then
+                      bsr_colind(ptr_bsr) = k1
+                      bsr_fao_idx(ptr_bsr) = kj
+                      ptr_bsr = ptr_bsr + 1
+                  end if
+              end do
+          end if
+      end do
+!$omp end parallel do
+      deallocate(row_counts)
+    end block
+    ! BSR CONSTRUCTION END
 	    !   IF THE CONTRIBUTION OF AN ATOM IN AN OCCUPIED LMO IS VERY SMALL
 	    !   THEN DO NOT USE THAT ATOM IN CALCULATING THE OCCUPIED-VIRTUAL
 	    !   INTERACTION.  PUT THE CONTRIBUTIONS INTO AN ARRAY 'AOCC'.
@@ -763,6 +832,8 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
     integer :: loopi, l, j, j1, jx, k, k1, kk, kj, kl, jl, ii, i4
     double precision :: sum, f_val, p_val
     integer :: v_off(nce(i))
+    integer :: atom_cvir_off(numat)
+    integer :: ptr_bsr
 
     loopi = ncvir(i)
     if (prev_i > 0) then
@@ -790,99 +861,57 @@ subroutine diagg1 (fao, nocc, nvir, eigv, ws, latoms, ifmo, fmo, fmo_dim, nij, i
       end do
     end do
 
-    if (lijbo) then
-      do kk = 1, nce(i)
-        k1 = icvir(nnce(i)+kk)
-        kl = v_off(kk)
-        do j = 1, nce(i)
-          j1 = icvir(nnce(i)+j)
-          kj = nijbo(k1, j1)
-          if (kj >= 0) then
-            if (avir(k1)*p(kj+1) > cutoff) then
-              if (iorbs(k1) == 1 .and. iorbs(j1) == 1) then
-                ws(nfirst(j1)) = ws(nfirst(j1)) + fao(kj+1) * cvir(kl+1)
-              else
-                if (k1 > j1) then
-                  ii = kj
+    atom_cvir_off(:) = -1
+    do kk = 1, nce(i)
+      k1 = icvir(nnce(i)+kk)
+      atom_cvir_off(k1) = v_off(kk)
+    end do
+
+    do j = 1, nce(i)
+      j1 = icvir(nnce(i)+j)
+      do ptr_bsr = bsr_rowptr(j1), bsr_rowptr(j1+1)-1
+        k1 = bsr_colind(ptr_bsr)
+        kl = atom_cvir_off(k1)
+        if (kl >= 0) then
+          kj = bsr_fao_idx(ptr_bsr)
+          if (avir(k1)*p(kj+1) > cutoff) then
+            if (iorbs(k1) == 1 .and. iorbs(j1) == 1) then
+              ws(nfirst(j1)) = ws(nfirst(j1)) + fao(kj+1) * cvir(kl+1)
+            else
+              if (k1 > j1) then
+                ii = kj
+                do i4 = 1, iorbs(k1)
+                  f_val = cvir(kl+i4)
+                  do jx = 1, iorbs(j1)
+                    ii = ii + 1
+                    ws(nfirst(j1)+jx-1) = ws(nfirst(j1)+jx-1) + fao(ii) * f_val
+                  end do
+                end do
+              else if (k1 < j1) then
+                ii = kj
+                do jx = 1, iorbs(j1)
                   do i4 = 1, iorbs(k1)
-                    f_val = cvir(kl+i4)
-                    do jx = 1, iorbs(j1)
-                      ii = ii + 1
-                      ws(nfirst(j1)+jx-1) = ws(nfirst(j1)+jx-1) + fao(ii) * f_val
-                    end do
+                    ii = ii + 1
+                    ws(nfirst(j1)+jx-1) = ws(nfirst(j1)+jx-1) + fao(ii) * cvir(kl+i4)
                   end do
-                else if (k1 < j1) then
-                  ii = kj
-                  do jx = 1, iorbs(j1)
-                    do i4 = 1, iorbs(k1)
-                      ii = ii + 1
-                      ws(nfirst(j1)+jx-1) = ws(nfirst(j1)+jx-1) + fao(ii) * cvir(kl+i4)
-                    end do
+                end do
+              else
+                do jx = 1, iorbs(j1)
+                  do i4 = 1, iorbs(j1)
+                    if (i4 > jx) then
+                      ii = kj + (i4*(i4-1)) / 2 + jx
+                    else
+                      ii = kj + (jx*(jx-1)) / 2 + i4
+                    end if
+                    ws(nfirst(j1)+jx-1) = ws(nfirst(j1)+jx-1) + fao(ii) * cvir(kl+i4)
                   end do
-                else
-                  do jx = 1, iorbs(j1)
-                    do i4 = 1, iorbs(j1)
-                      if (i4 > jx) then
-                        ii = kj + (i4*(i4-1)) / 2 + jx
-                      else
-                        ii = kj + (jx*(jx-1)) / 2 + i4
-                      end if
-                      ws(nfirst(j1)+jx-1) = ws(nfirst(j1)+jx-1) + fao(ii) * cvir(kl+i4)
-                    end do
-                  end do
-                end if
+                end do
               end if
             end if
           end if
-        end do
+        end if
       end do
-    else
-      do kk = 1, nce(i)
-        k1 = icvir(nnce(i)+kk)
-        kl = v_off(kk)
-        do j = 1, nce(i)
-          j1 = icvir(nnce(i)+j)
-          kj = ijbo (k1, j1)
-          if (kj >= 0) then
-            if (avir(k1)*p(kj+1) > cutoff) then
-              if (iorbs(k1) == 1 .and. iorbs(j1) == 1) then
-                ws(nfirst(j1)) = ws(nfirst(j1)) + fao(kj+1) * cvir(kl+1)
-              else
-                if (k1 > j1) then
-                  ii = kj
-                  do i4 = 1, iorbs(k1)
-                    f_val = cvir(kl+i4)
-                    do jx = 1, iorbs(j1)
-                      ii = ii + 1
-                      ws(nfirst(j1)+jx-1) = ws(nfirst(j1)+jx-1) + fao(ii) * f_val
-                    end do
-                  end do
-                else if (k1 < j1) then
-                  ii = kj
-                  do jx = 1, iorbs(j1)
-                    do i4 = 1, iorbs(k1)
-                      ii = ii + 1
-                      ws(nfirst(j1)+jx-1) = ws(nfirst(j1)+jx-1) + fao(ii) * cvir(kl+i4)
-                    end do
-                  end do
-                else
-                  do jx = 1, iorbs(j1)
-                    do i4 = 1, iorbs(j1)
-                      if (i4 > jx) then
-                        ii = kj + (i4*(i4-1)) / 2 + jx
-                      else
-                        ii = kj + (jx*(jx-1)) / 2 + i4
-                      end if
-                      ws(nfirst(j1)+jx-1) = ws(nfirst(j1)+jx-1) + fao(ii) * cvir(kl+i4)
-                    end do
-                  end do
-                end if
-              end if
-            end if
-          end if
-        end do
-      end do
-    end if
+    end do
 
     do j = nnce(i) + 1, nnce(i) + nce(i)
       j1 = icvir(j)
