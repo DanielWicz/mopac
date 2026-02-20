@@ -26,7 +26,7 @@ subroutine density_for_MOZYME (p, mode, nclose_loc, partp)
    !***********************************************************************
     use molkst_C, only: numat, mpack, keywrd
     use MOZYME_C, only : lijbo, nijbo, ncf, ncocc, &
-      nncf, iorbs, cocc, icocc
+      nncf, iorbs, cocc, icocc, icocc_dim
     use chanel_C, only: iw
 #ifdef _OPENMP
     use omp_lib, only: omp_get_max_threads, omp_get_num_threads, omp_get_thread_num
@@ -37,17 +37,15 @@ subroutine density_for_MOZYME (p, mode, nclose_loc, partp)
     double precision, dimension (mpack), intent (inout) :: p
     logical :: first = .true.
     logical, save :: prnt
-    integer :: i, j, j1, ja, jj, k, k1, k2, ka, kk, l, loop, nj
     integer :: max_threads
     logical :: use_parallel_density
     double precision :: spinfa, sum
-#ifdef _OPENMP
-    double precision, allocatable, save :: p_thread(:, :)
-    integer, save :: p_thread_mpack = 0
-    integer, save :: p_thread_nthreads = 0
-    integer :: tid, nthreads_used
-#endif
     integer, external :: ijbo
+
+    integer, allocatable, save :: atom_lmo_ptr(:), atom_lmo_idx(:), atom_lmo_off(:)
+    integer, allocatable :: atom_degree(:)
+    integer :: pos, i_lmo, jj_idx, j_atom, off_j, ptr, l_idx
+    integer :: i, j, j1, k, k1, k2, ka, kk, l
 
     if (first) then
       first = .false.
@@ -61,237 +59,194 @@ subroutine density_for_MOZYME (p, mode, nclose_loc, partp)
 #endif
 
     if (mode == 0) then
-      !
-      !  INITIALIZE P:  FULL DENSITY CALCULATION
-      !
-      if (use_parallel_density) then
 #ifdef _OPENMP
+      if (use_parallel_density) then
 !$omp parallel do schedule(static)
         do l = 1, mpack
           p(l) = 0.d0
         end do
 !$omp end parallel do
-#endif
       else
+#endif
         p(:) = 0.d0
-      end if
-    else if (mode ==-1) then
-      !
-      !   FULL DENSITY MATRIX IS IN PARTP, REMOVE DENSITY DUE TO
-      !   OLD LMO's USED IN SCF
-      !
-      if (use_parallel_density) then
 #ifdef _OPENMP
+      end if
+#endif
+    else if (mode ==-1) then
+#ifdef _OPENMP
+      if (use_parallel_density) then
 !$omp parallel do schedule(static)
         do l = 1, mpack
           p(l) = -0.5d0 * partp(l)
         end do
 !$omp end parallel do
-#endif
       else
+#endif
         p(:) = -0.5d0 * partp(:)
-      end if
-    else
-      !
-      !   PARTIAL DENSITY MATRIX IS IN PARTP, BUILD THE REST OF P
-      !
-      if (use_parallel_density) then
 #ifdef _OPENMP
+      end if
+#endif
+    else
+#ifdef _OPENMP
+      if (use_parallel_density) then
 !$omp parallel do schedule(static)
         do l = 1, mpack
           p(l) = 0.5d0 * partp(l)
         end do
 !$omp end parallel do
-#endif
       else
+#endif
         p(:) = 0.5d0 * partp(:)
+#ifdef _OPENMP
       end if
+#endif
     end if
 
+    ! INSPECTOR PHASE
+    if (.not. allocated(atom_lmo_ptr) .or. size(atom_lmo_ptr) < numat + 2) then
+        if (allocated(atom_lmo_ptr)) deallocate(atom_lmo_ptr, atom_lmo_idx, atom_lmo_off)
+        allocate(atom_lmo_ptr(numat + 2))
+        allocate(atom_lmo_idx(icocc_dim), atom_lmo_off(icocc_dim))
+    end if
+
+    allocate(atom_degree(numat))
+    atom_degree = 0
+    do i_lmo = 1, nclose_loc
+        do jj_idx = nncf(i_lmo) + 1, nncf(i_lmo) + ncf(i_lmo)
+            j_atom = icocc(jj_idx)
+            atom_degree(j_atom) = atom_degree(j_atom) + 1
+        end do
+    end do
+
+    atom_lmo_ptr(1) = 1
+    do j_atom = 1, numat
+        atom_lmo_ptr(j_atom + 1) = atom_lmo_ptr(j_atom) + atom_degree(j_atom)
+    end do
+    
+    atom_degree(1:numat) = atom_lmo_ptr(1:numat)
+
+    do i_lmo = 1, nclose_loc
+        off_j = ncocc(i_lmo)
+        do jj_idx = nncf(i_lmo) + 1, nncf(i_lmo) + ncf(i_lmo)
+            j_atom = icocc(jj_idx)
+            pos = atom_degree(j_atom)
+            atom_lmo_idx(pos) = i_lmo
+            atom_lmo_off(pos) = off_j
+            atom_degree(j_atom) = pos + 1
+            off_j = off_j + iorbs(j_atom)
+        end do
+    end do
+    deallocate(atom_degree)
+
+    ! EXECUTOR PHASE
 #ifdef _OPENMP
     if (use_parallel_density) then
-      if ((.not. allocated(p_thread)) .or. p_thread_mpack /= mpack .or. p_thread_nthreads < max_threads) then
-        if (allocated(p_thread)) deallocate (p_thread)
-        allocate (p_thread(mpack, max_threads))
-        p_thread_mpack = mpack
-        p_thread_nthreads = max_threads
-      end if
+!$omp parallel do schedule(dynamic, 4) private(j, ptr, i, off_j, ka, kk, k, l, l_idx, j1, k1, k2, sum)
+      do j = 1, numat
+        do ptr = atom_lmo_ptr(j), atom_lmo_ptr(j+1) - 1
+            i = atom_lmo_idx(ptr)
+            off_j = atom_lmo_off(ptr)
 
-      nthreads_used = 1
-!$omp parallel default(shared) private(i, loop, ja, jj, j, nj, ka, kk, k, l, j1, k1, k2, sum, tid)
-      tid = omp_get_thread_num() + 1
-!$omp single
-      nthreads_used = omp_get_num_threads()
-!$omp end single
-      p_thread(:, tid) = 0.d0
-!$omp do schedule(static, 1)
-      do i = 1, nclose_loc
-        loop = ncocc(i)
-        ja = 0
-        if (lijbo) then
-          do jj = nncf(i) + 1, nncf(i) + ncf(i)
-            j = icocc(jj)
-            nj = iorbs(j)
-            ka = loop
+            ka = ncocc(i)
             do kk = nncf(i) + 1, nncf(i) + ncf(i)
-              k = icocc(kk)
-              if (j == k) then
-                l = nijbo (j, k)
-                do j1 = 1, nj
-                  sum = cocc(ja+j1+loop)
-                  do k1 = 1, j1
-                    k2 = ka + k1
-                    l = l + 1
-                    p_thread(l, tid) = p_thread(l, tid) + cocc(k2) * sum
-                  end do
-                end do
-              else if (j > k .and. nijbo (j, k) >= 0) then
-                l = nijbo (j, k)
-                do j1 = 1, nj
-                  sum = cocc(ja+j1+loop)
-                  do k1 = 1, iorbs(k)
-                    k2 = ka + k1
-                    l = l + 1
-                    p_thread(l, tid) = p_thread(l, tid) + cocc(k2) * sum
-                  end do
-                end do
-              end if
-              ka = ka + iorbs(k)
+                k = icocc(kk)
+                if (j == k) then
+                    if (lijbo) then
+                        l = nijbo(j, k)
+                    else
+                        l = ijbo(j, k)
+                    end if
+                    l_idx = l
+                    do j1 = 1, iorbs(j)
+                        sum = cocc(off_j + j1)
+                        do k1 = 1, j1
+                            k2 = ka + k1
+                            l_idx = l_idx + 1
+                            p(l_idx) = p(l_idx) + cocc(k2) * sum
+                        end do
+                    end do
+                else if (j > k) then
+                    if (lijbo) then
+                        l = nijbo(j, k)
+                    else
+                        l = ijbo(j, k)
+                    end if
+                    if (l >= 0) then
+                        l_idx = l
+                        do j1 = 1, iorbs(j)
+                            sum = cocc(off_j + j1)
+                            do k1 = 1, iorbs(k)
+                                k2 = ka + k1
+                                l_idx = l_idx + 1
+                                p(l_idx) = p(l_idx) + cocc(k2) * sum
+                            end do
+                        end do
+                    end if
+                end if
+                ka = ka + iorbs(k)
             end do
-            ja = ja + nj
-          end do
-        else
-          do jj = nncf(i) + 1, nncf(i) + ncf(i)
-            j = icocc(jj)
-            nj = iorbs(j)
-            ka = loop
-            do kk = nncf(i) + 1, nncf(i) + ncf(i)
-              k = icocc(kk)
-              l = ijbo (j, k)
-              if (j == k) then
-                do j1 = 1, nj
-                  sum = cocc(ja+j1+loop)
-                  do k1 = 1, j1
-                    k2 = ka + k1
-                    l = l + 1
-                    p_thread(l, tid) = p_thread(l, tid) + cocc(k2) * sum
-                  end do
-                end do
-              else if (j > k .and. l >= 0) then
-                do j1 = 1, nj
-                  sum = cocc(ja+j1+loop)
-                  do k1 = 1, iorbs(k)
-                    k2 = ka + k1
-                    l = l + 1
-                    p_thread(l, tid) = p_thread(l, tid) + cocc(k2) * sum
-                  end do
-                end do
-              end if
-              ka = ka + iorbs(k)
-            end do
-            ja = ja + nj
-          end do
-        end if
-      end do
-!$omp end do
-!$omp end parallel
-
-!$omp parallel do schedule(static) private(tid, sum)
-      do l = 1, mpack
-        sum = 0.d0
-        do tid = 1, nthreads_used
-          sum = sum + p_thread(l, tid)
         end do
-        p(l) = p(l) + sum
       end do
 !$omp end parallel do
     else
 #endif
-      do i = 1, nclose_loc
-        loop = ncocc(i)
-        ja = 0
-        if (lijbo) then
-          do jj = nncf(i) + 1, nncf(i) + ncf(i)
-            j = icocc(jj)
-            nj = iorbs(j)
-            ka = loop
+      do j = 1, numat
+        do ptr = atom_lmo_ptr(j), atom_lmo_ptr(j+1) - 1
+            i = atom_lmo_idx(ptr)
+            off_j = atom_lmo_off(ptr)
+
+            ka = ncocc(i)
             do kk = nncf(i) + 1, nncf(i) + ncf(i)
-              k = icocc(kk)
-              if (j == k) then
-                l = nijbo (j, k)
-                do j1 = 1, nj
-                  sum = cocc(ja+j1+loop)
-                  do k1 = 1, j1
-                    k2 = ka + k1
-                    l = l + 1
-                    p(l) = p(l) + cocc(k2) * sum
-                  end do
-                end do
-              else if (j > k .and. nijbo (j, k) >= 0) then
-                l = nijbo (j, k)
-                do j1 = 1, nj
-                  sum = cocc(ja+j1+loop)
-                  do k1 = 1, iorbs(k)
-                    k2 = ka + k1
-                    l = l + 1
-                    p(l) = p(l) + cocc(k2) * sum
-                  end do
-                end do
-              end if
-              ka = ka + iorbs(k)
+                k = icocc(kk)
+                if (j == k) then
+                    if (lijbo) then
+                        l = nijbo(j, k)
+                    else
+                        l = ijbo(j, k)
+                    end if
+                    l_idx = l
+                    do j1 = 1, iorbs(j)
+                        sum = cocc(off_j + j1)
+                        do k1 = 1, j1
+                            k2 = ka + k1
+                            l_idx = l_idx + 1
+                            p(l_idx) = p(l_idx) + cocc(k2) * sum
+                        end do
+                    end do
+                else if (j > k) then
+                    if (lijbo) then
+                        l = nijbo(j, k)
+                    else
+                        l = ijbo(j, k)
+                    end if
+                    if (l >= 0) then
+                        l_idx = l
+                        do j1 = 1, iorbs(j)
+                            sum = cocc(off_j + j1)
+                            do k1 = 1, iorbs(k)
+                                k2 = ka + k1
+                                l_idx = l_idx + 1
+                                p(l_idx) = p(l_idx) + cocc(k2) * sum
+                            end do
+                        end do
+                    end if
+                end if
+                ka = ka + iorbs(k)
             end do
-            ja = ja + nj
-          end do
-        else
-          do jj = nncf(i) + 1, nncf(i) + ncf(i)
-            j = icocc(jj)
-            nj = iorbs(j)
-            ka = loop
-            do kk = nncf(i) + 1, nncf(i) + ncf(i)
-              k = icocc(kk)
-              l = ijbo (j, k)
-              if (j == k) then
-                do j1 = 1, nj
-                  sum = cocc(ja+j1+loop)
-                  do k1 = 1, j1
-                    k2 = ka + k1
-                    l = l + 1
-                    p(l) = p(l) + cocc(k2) * sum
-                  end do
-                end do
-              else if (j > k .and. l >= 0) then
-                do j1 = 1, nj
-                  sum = cocc(ja+j1+loop)
-                  do k1 = 1, iorbs(k)
-                    k2 = ka + k1
-                    l = l + 1
-                    p(l) = p(l) + cocc(k2) * sum
-                  end do
-                end do
-              end if
-              ka = ka + iorbs(k)
-            end do
-            ja = ja + nj
-          end do
-        end if
+        end do
       end do
 #ifdef _OPENMP
     end if
 #endif
+
     if (mode == 0 .or. mode == 1) then
-      !
-      !    FULL DENSITY CALCULATION.  MULTIPLY BY 2 FOR SPIN
-      !
       spinfa = 2.d0
     else if (mode ==-1) then
-      !
-      !   MAKING PARTIAL DENSITY MATRIX. REVERSE SIGN ONCE MORE
-      !
       spinfa = -2.d0
     else
       spinfa = 1.d0
     end if
-   !
+   
     if (Abs(spinfa - 1.d0) > 1.d-10) then
 #ifdef _OPENMP
       if (use_parallel_density) then
@@ -301,12 +256,13 @@ subroutine density_for_MOZYME (p, mode, nclose_loc, partp)
         end do
 !$omp end parallel do
       else
+#endif
         p(:) = spinfa * p(:)
+#ifdef _OPENMP
       end if
-#else
-      p(:) = spinfa * p(:)
 #endif
     end if
+
     if (prnt) then
       sum = 0.d0
       if (lijbo) then
