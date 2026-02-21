@@ -69,16 +69,25 @@
 	    logical :: task_capable, force_explore
 	    double precision :: t_start, elapsed, edge_cost
 		    integer, allocatable :: edge_level(:), active_edges(:), last_occ(:), last_vir(:)
-		    integer, allocatable :: rem_edges(:), next_edges(:)
-		    integer, allocatable :: level_count(:), level_offset(:), level_pos(:), level_edges(:)
+		    integer, allocatable :: next_edges(:)
+		    integer, allocatable :: level_count(:), level_pos(:)
+		    integer, allocatable, save :: level_offset(:), level_edges(:), level_active_edges(:)
+		    integer, save :: level_cached_nactive = -1, level_cached_max_level = 0
+		    integer, save :: level_cached_nij = -1, level_cached_nocc = -1, level_cached_nvir = -1
+		    logical, save :: level_cached_valid = .false.
 		    integer :: max_deg, key
+		    integer :: col, col_alpha, col_beta, col_common
+		    integer :: e_path, j_cur, i_cur, path_len, idx
 		    integer, allocatable :: deg_occ(:), deg_vir(:)
 		    integer, allocatable :: bucket_count(:), bucket_pos(:)
+		    integer, allocatable :: occ_color(:,:), vir_color(:,:)
+		    integer, allocatable :: path_edges(:), path_colors(:)
 		    integer, allocatable, save :: iused_ws(:,:)
 		    logical, allocatable, save :: latoms_ws(:,:)
 		    double precision, allocatable, save :: storei_ws(:,:), storej_ws(:,:)
 		    double precision, allocatable :: sumb_thread(:)
 		    integer, allocatable :: nrej_thread(:)
+		    logical :: reuse_level_sched
 	    logical :: need_ws_resize
 	    logical :: active
 	    integer :: occ_span_max, vir_span_max, nrem, nnext, iedge
@@ -194,8 +203,8 @@
 	    max_threads = omp_get_max_threads()
 	    use_parallel_diagg2 = (max_threads > 1 .and. nij > 64)
 		    if (use_parallel_diagg2) then
-		      allocate (edge_level(nij), active_edges(nij), rem_edges(nij), next_edges(nij), &
-		           & last_occ(nocc), last_vir(nvir), stat=alloc_stat)
+			      allocate (edge_level(nij), active_edges(nij), next_edges(nij), &
+			           & last_occ(nocc), last_vir(nvir), stat=alloc_stat)
 		      if (alloc_stat /= 0) then
 		        call mopend("Insufficient memory to run DIAGG2 (parallel scheduling)")
 		        use_parallel_diagg2 = .false.
@@ -391,36 +400,36 @@
 		              ! Allocation is skipped when dimensions already satisfy:
 		              !   ws_rows >= required_rows and ws_cols >= diagg2_threads.
 		              ! Eq. (D2): backup rows are bounded by max reserved LMO span, not global norbs.
-		              if (allocated(iused_ws) .and. allocated(latoms_ws) .and. allocated(storei_ws) .and. allocated(storej_ws)) then
-		                if (size(iused_ws,1) >= numat .and. size(iused_ws,2) >= diagg2_threads .and. &
-		                   & size(latoms_ws,1) >= numat .and. size(latoms_ws,2) >= diagg2_threads .and. &
-		                   & size(storei_ws,1) >= vir_span_max .and. size(storei_ws,2) >= diagg2_threads .and. &
-		                   & size(storej_ws,1) >= occ_span_max .and. size(storej_ws,2) >= diagg2_threads) then
-		                  need_ws_resize = .false.
+			              if (allocated(iused_ws) .and. allocated(latoms_ws) .and. allocated(storei_ws) .and. allocated(storej_ws)) then
+			                if (size(iused_ws,1) >= numat .and. size(iused_ws,2) >= diagg2_threads .and. &
+			                   & size(latoms_ws,1) >= numat .and. size(latoms_ws,2) >= diagg2_threads .and. &
+			                   & size(storei_ws,1) >= vir_span_max .and. size(storei_ws,2) >= diagg2_threads .and. &
+			                   & size(storej_ws,1) >= occ_span_max .and. size(storej_ws,2) >= diagg2_threads) then
+			                  need_ws_resize = .false.
+			                end if
+			              end if
+
+		              if (need_ws_resize) then
+		                if (allocated(iused_ws)) deallocate (iused_ws)
+		                if (allocated(latoms_ws)) deallocate (latoms_ws)
+		                if (allocated(storei_ws)) deallocate (storei_ws)
+		                if (allocated(storej_ws)) deallocate (storej_ws)
+
+			                ! Scratch footprint scales as O((numat + span_occ + span_vir)*threads), reused.
+		                allocate (iused_ws(numat, diagg2_threads), latoms_ws(numat, diagg2_threads), &
+		                     & storei_ws(vir_span_max, diagg2_threads), &
+		                     & storej_ws(occ_span_max, diagg2_threads), stat=alloc_stat)
+		                if (alloc_stat /= 0) then
+		                  call mopend("Insufficient memory to run DIAGG2 (parallel scratch workspace)")
 		                end if
+		                !
+		                ! Eq. (D3): initialize thread-local marker state once per (re)allocation.
+		                ! Per-pair sparse resets keep markers clean, so we avoid O(numat*threads)
+		                ! full clears at each DIAGG2 call.
+		                !
+		                iused_ws(:, :) = -1
+		                latoms_ws(:, :) = .false.
 		              end if
-
-	              if (need_ws_resize) then
-	                if (allocated(iused_ws)) deallocate (iused_ws)
-	                if (allocated(latoms_ws)) deallocate (latoms_ws)
-	                if (allocated(storei_ws)) deallocate (storei_ws)
-	                if (allocated(storej_ws)) deallocate (storej_ws)
-
-		                ! Scratch footprint scales as O((numat + span_occ + span_vir)*threads), reused.
-	                allocate (iused_ws(numat, diagg2_threads), latoms_ws(numat, diagg2_threads), &
-	                     & storei_ws(vir_span_max, diagg2_threads), &
-	                     & storej_ws(occ_span_max, diagg2_threads), stat=alloc_stat)
-	                if (alloc_stat /= 0) then
-	                  call mopend("Insufficient memory to run DIAGG2 (parallel scratch workspace)")
-	                end if
-	                !
-	                ! Eq. (D3): initialize thread-local marker state once per (re)allocation.
-	                ! Per-pair sparse resets keep markers clean, so we avoid O(numat*threads)
-	                ! full clears at each DIAGG2 call.
-	                !
-	                iused_ws(:, :) = -1
-	                latoms_ws(:, :) = .false.
-	              end if
 
 	              if (.not. allocated(tune_calls) .or. size(tune_calls) < max_threads) then
 	                if (allocated(tune_calls)) deallocate (tune_calls)
@@ -533,8 +542,8 @@
 !$omp task default(shared) firstprivate(ij, i_task, j_task) private(tid) &
 !$omp& depend(inout:last_occ(j_task), last_vir(i_task))
 		                    tid = omp_get_thread_num() + 1
-		                    call process_pair (ij, retry, tiny, biglim, sumb_thread(tid), nrej_thread(tid), &
-		                         & iused_ws(:,tid), latoms_ws(:,tid), storei_ws(:,tid), storej_ws(:,tid))
+			                    call process_pair (ij, retry, tiny, biglim, sumb_thread(tid), nrej_thread(tid), &
+			                         & iused_ws(:,tid), latoms_ws(:,tid), storei_ws(:,tid), storej_ws(:,tid))
 !$omp end task
 		                  end do
 		                  batch_start = batch_end + 1
@@ -577,69 +586,189 @@
 	                  nrej = nrej + nrej_thread(tid)
 	                end do
 	                deallocate (sumb_thread, nrej_thread)
-		              else
-		                !
-		                ! Eq. (D1): build exact level schedule only when level mode is selected.
-	                ! Repeated maximal matchings M_k satisfy:
-	                !   e=(i,j) in M_k => i and j are unique within level k.
-	                ! This preserves conflict-free pair rotations in each level.
-	                !
-			                edge_level(:) = 0
-			                last_occ(:) = 0
-			                last_vir(:) = 0
-			                rem_edges(1:nactive) = active_edges(1:nactive)
-	                nrem = nactive
-	                max_level = 0
-	                do while (nrem > 0)
-	                  max_level = max_level + 1
-	                  nnext = 0
-	                  do iedge = 1, nrem
-	                    ij = rem_edges(iedge)
-	                    i = ifmo(1, ij)
-	                    j = ifmo(2, ij)
-	                    if (last_occ(j) == max_level .or. last_vir(i) == max_level) then
-	                      nnext = nnext + 1
-	                      next_edges(nnext) = ij
-	                    else
-	                      edge_level(ij) = max_level
-	                      last_occ(j) = max_level
-	                      last_vir(i) = max_level
-	                    end if
-	                  end do
-	                  if (nnext > 0) rem_edges(1:nnext) = next_edges(1:nnext)
-	                  nrem = nnext
-	                end do
+			              else
+			                !
+			                ! Level mode (inspector–executor):
+			                !   - Inspector: build a high-quality bipartite edge-coloring schedule.
+			                !   - Executor : reuse the cached schedule across SCF iterations when the
+			                !               active edge set is unchanged.
+			                !
+			                reuse_level_sched = .false.
+			                if (level_cached_valid) then
+			                  if (level_cached_nactive == nactive .and. level_cached_nij == nij .and. &
+			                     & level_cached_nocc == nocc .and. level_cached_nvir == nvir) then
+			                    if (allocated(level_active_edges)) then
+			                      reuse_level_sched = (size(level_active_edges) >= nactive)
+			                      if (reuse_level_sched) then
+			                        do pos = 1, nactive
+			                          if (level_active_edges(pos) /= active_edges(pos)) then
+			                            reuse_level_sched = .false.
+			                            exit
+			                          end if
+			                        end do
+			                      end if
+			                    end if
+			                  end if
+			                end if
 
-	                if (allocated(level_count)) deallocate (level_count)
-	                if (allocated(level_offset)) deallocate (level_offset)
-	                if (allocated(level_pos)) deallocate (level_pos)
-	                if (allocated(level_edges)) deallocate (level_edges)
-	                allocate (level_count(max_level), level_offset(max_level+1), level_pos(max_level), &
-	                     & level_edges(nactive), stat=alloc_stat)
-	                if (alloc_stat /= 0) then
-	                  call mopend("Insufficient memory to run DIAGG2 (level schedule)")
-	                end if
+			                if (.not. reuse_level_sched) then
+			                  !
+			                  ! Build a Δ-edge-coloring (Δ=max_deg) for the occupied–virtual bipartite graph
+			                  ! using alternating-path recoloring. This yields <= Δ levels, improving
+			                  ! concurrency vs repeated maximal-match rounds.
+			                  !
+			                  edge_level(:) = 0
+			                  allocate (occ_color(max_deg, nocc), vir_color(max_deg, nvir), &
+			                       & path_edges(nocc+nvir), path_colors(nocc+nvir), stat=alloc_stat)
+			                  if (alloc_stat /= 0) then
+			                    call mopend("Insufficient memory to run DIAGG2 (edge coloring)")
+			                  end if
+			                  occ_color(:,:) = 0
+			                  vir_color(:,:) = 0
+			                  max_level = 0
+			                  do iedge = 1, nactive
+			                    ij = active_edges(iedge)
+			                    i = ifmo(1, ij)
+			                    j = ifmo(2, ij)
+			                    !
+			                    ! Try a common missing color first (cheap success path).
+			                    !
+			                    col_common = 0
+			                    do col = 1, max_deg
+			                      if (occ_color(col, j) == 0 .and. vir_color(col, i) == 0) then
+			                        col_common = col
+			                        exit
+			                      end if
+			                    end do
+			                    if (col_common /= 0) then
+			                      edge_level(ij) = col_common
+			                      occ_color(col_common, j) = ij
+			                      vir_color(col_common, i) = ij
+			                      max_level = Max (max_level, col_common)
+			                      cycle
+			                    end if
+			                    !
+			                    ! No common free color: recolor along the (alpha,beta) alternating path
+			                    ! to free beta at occupied node j, then color (i,j) with beta.
+			                    !
+			                    col_alpha = 0
+			                    do col = 1, max_deg
+			                      if (occ_color(col, j) == 0) then
+			                        col_alpha = col
+			                        exit
+			                      end if
+			                    end do
+			                    col_beta = 0
+			                    do col = 1, max_deg
+			                      if (vir_color(col, i) == 0) then
+			                        col_beta = col
+			                        exit
+			                      end if
+			                    end do
+			                    path_len = 0
+			                    j_cur = j
+			                    do
+			                      e_path = occ_color(col_beta, j_cur)
+			                      if (e_path == 0) exit
+			                      path_len = path_len + 1
+			                      path_edges(path_len) = e_path
+			                      path_colors(path_len) = col_beta
+			                      i_cur = ifmo(1, e_path)
+			                      e_path = vir_color(col_alpha, i_cur)
+			                      if (e_path == 0) exit
+			                      path_len = path_len + 1
+			                      path_edges(path_len) = e_path
+			                      path_colors(path_len) = col_alpha
+			                      j_cur = ifmo(2, e_path)
+			                    end do
+			                    do idx = 1, path_len
+			                      e_path = path_edges(idx)
+			                      j_cur = ifmo(2, e_path)
+			                      i_cur = ifmo(1, e_path)
+			                      if (path_colors(idx) == col_alpha) then
+			                        occ_color(col_alpha, j_cur) = 0
+			                        vir_color(col_alpha, i_cur) = 0
+			                        occ_color(col_beta, j_cur) = e_path
+			                        vir_color(col_beta, i_cur) = e_path
+			                        edge_level(e_path) = col_beta
+			                      else
+			                        occ_color(col_beta, j_cur) = 0
+			                        vir_color(col_beta, i_cur) = 0
+			                        occ_color(col_alpha, j_cur) = e_path
+			                        vir_color(col_alpha, i_cur) = e_path
+			                        edge_level(e_path) = col_alpha
+			                      end if
+			                    end do
+			                    edge_level(ij) = col_beta
+			                    occ_color(col_beta, j) = ij
+			                    vir_color(col_beta, i) = ij
+			                    max_level = Max (max_level, col_alpha, col_beta)
+			                  end do
+			                  deallocate (occ_color, vir_color, path_edges, path_colors)
 
-	                level_count(:) = 0
-	                do iedge = 1, nactive
-	                  ij = active_edges(iedge)
-	                  lvl = edge_level(ij)
-	                  level_count(lvl) = level_count(lvl) + 1
-	                end do
-	                level_offset(1) = 1
-	                do lvl = 1, max_level
-	                  level_offset(lvl+1) = level_offset(lvl) + level_count(lvl)
-	                end do
-	                level_pos(:) = level_offset(1:max_level)
-	                do iedge = 1, nactive
-	                  ij = active_edges(iedge)
-	                  lvl = edge_level(ij)
-	                  pos = level_pos(lvl)
-	                  level_edges(pos) = ij
-	                  level_pos(lvl) = pos + 1
-	                end do
+			                  !
+			                  ! Bucket active edges by level into persistent cached arrays.
+			                  !
+			                  if (allocated(level_active_edges)) then
+			                    if (size(level_active_edges) < nactive) deallocate (level_active_edges)
+			                  end if
+			                  if (.not. allocated(level_active_edges)) then
+			                    allocate (level_active_edges(nactive), stat=alloc_stat)
+			                    if (alloc_stat /= 0) call mopend("Insufficient memory to run DIAGG2 (schedule cache)")
+			                  end if
+			                  level_active_edges(1:nactive) = active_edges(1:nactive)
 
-			                sumb_local = 0.d0
+			                  if (allocated(level_offset)) then
+			                    if (size(level_offset) < max_level + 1) deallocate (level_offset)
+			                  end if
+			                  if (.not. allocated(level_offset)) then
+			                    allocate (level_offset(max_level+1), stat=alloc_stat)
+			                    if (alloc_stat /= 0) call mopend("Insufficient memory to run DIAGG2 (level offsets)")
+			                  end if
+			                  if (allocated(level_edges)) then
+			                    if (size(level_edges) < nactive) deallocate (level_edges)
+			                  end if
+			                  if (.not. allocated(level_edges)) then
+			                    allocate (level_edges(nactive), stat=alloc_stat)
+			                    if (alloc_stat /= 0) call mopend("Insufficient memory to run DIAGG2 (level edges)")
+			                  end if
+
+			                  if (allocated(level_count)) deallocate (level_count)
+			                  if (allocated(level_pos)) deallocate (level_pos)
+			                  allocate (level_count(max_level), level_pos(max_level), stat=alloc_stat)
+			                  if (alloc_stat /= 0) then
+			                    call mopend("Insufficient memory to run DIAGG2 (level schedule)")
+			                  end if
+			                  level_count(:) = 0
+			                  do iedge = 1, nactive
+			                    ij = active_edges(iedge)
+			                    lvl = edge_level(ij)
+			                    level_count(lvl) = level_count(lvl) + 1
+			                  end do
+			                  level_offset(1) = 1
+			                  do lvl = 1, max_level
+			                    level_offset(lvl+1) = level_offset(lvl) + level_count(lvl)
+			                  end do
+			                  level_pos(:) = level_offset(1:max_level)
+			                  do iedge = 1, nactive
+			                    ij = active_edges(iedge)
+			                    lvl = edge_level(ij)
+			                    pos = level_pos(lvl)
+			                    level_edges(pos) = ij
+			                    level_pos(lvl) = pos + 1
+			                  end do
+
+			                  level_cached_nactive = nactive
+			                  level_cached_max_level = max_level
+			                  level_cached_nij = nij
+			                  level_cached_nocc = nocc
+			                  level_cached_nvir = nvir
+			                  level_cached_valid = .true.
+			                else
+			                  max_level = level_cached_max_level
+			                end if
+
+				                sumb_local = 0.d0
 			                nrej_local = 0
 			                t_start = omp_get_wtime()
 !$omp parallel num_threads(diagg2_threads) default(shared) private(ij, lvl, pos, tid) &
@@ -648,11 +777,11 @@
 
 	                do lvl = 1, max_level
 !$omp do schedule(dynamic,16)
-	                  do pos = level_offset(lvl), level_offset(lvl+1) - 1
-	                    ij = level_edges(pos)
-	                    call process_pair (ij, retry, tiny, biglim, sumb_local, nrej_local, &
-	                         & iused_ws(:,tid), latoms_ws(:,tid), storei_ws(:,tid), storej_ws(:,tid))
-	                  end do
+		                  do pos = level_offset(lvl), level_offset(lvl+1) - 1
+		                    ij = level_edges(pos)
+		                    call process_pair (ij, retry, tiny, biglim, sumb_local, nrej_local, &
+		                         & iused_ws(:,tid), latoms_ws(:,tid), storei_ws(:,tid), storej_ws(:,tid))
+		                  end do
 !$omp end do
 	                end do
 !$omp end parallel
@@ -674,14 +803,12 @@
 		              use_parallel_diagg2 = .false.
 		            end if
 
-		            if (allocated(level_edges)) deallocate (level_edges)
-		            if (allocated(level_pos)) deallocate (level_pos)
-		            if (allocated(level_offset)) deallocate (level_offset)
-		            if (allocated(level_count)) deallocate (level_count)
+			            if (allocated(level_pos)) deallocate (level_pos)
+			            if (allocated(level_count)) deallocate (level_count)
 	          end if
 	        end if
 
-	        deallocate (edge_level, active_edges, rem_edges, next_edges, last_occ, last_vir)
+		        deallocate (edge_level, active_edges, next_edges, last_occ, last_vir)
 	      end if
 #endif
 
@@ -748,9 +875,9 @@
               beta = -Sign (Sqrt(1.d0-alpha*alpha), c)
               sumb = sumb + Abs (beta)
               !
-              ! IDENTIFY THE ATOMS IN THE OCCUPIED LMO.  ATOMS NOT USED ARE
-              ! FLAGGED BY '-1' IN IUSED.
-              !
+	      ! IDENTIFY THE ATOMS IN THE OCCUPIED LMO.  ATOMS NOT USED ARE
+	      ! FLAGGED BY '-1' IN IUSED.
+	      !
               mlf = 0
               !
               do lf = nncf(j) + 1, nncf(j) + ncf(j)
@@ -900,15 +1027,15 @@
       call timer (" AFTER DIAGG2 IN ITER")
     end if
   contains
-	  subroutine process_pair (ij, retry, tiny, biglim, sumb_acc, nrej_acc, iused_t, latoms_t, storei_t, storej_t)
-    integer, intent (in) :: ij
-    logical, intent (in) :: retry
-    double precision, intent (in) :: tiny, biglim
-    double precision, intent (inout) :: sumb_acc
-	    integer, intent (inout) :: nrej_acc
-	    integer, dimension (numat), intent (inout) :: iused_t
-	    logical, dimension (numat), intent (inout) :: latoms_t
-	    double precision, dimension (:), intent (inout) :: storei_t, storej_t
+		  subroutine process_pair (ij, retry, tiny, biglim, sumb_acc, nrej_acc, iused_t, latoms_t, storei_t, storej_t)
+	    integer, intent (in) :: ij
+	    logical, intent (in) :: retry
+	    double precision, intent (in) :: tiny, biglim
+	    double precision, intent (inout) :: sumb_acc
+		    integer, intent (inout) :: nrej_acc
+		    integer, dimension (numat), intent (inout) :: iused_t
+		    logical, dimension (numat), intent (inout) :: latoms_t
+		    double precision, dimension (:), intent (inout) :: storei_t, storej_t
 
     integer :: i, j, ii, jur, l, ilr, incv, iur, jlr, jncf, k, le, lf, loopi, loopj
     integer :: mie, mle, mlee, mlf, mlff, ncei, ncfj
@@ -997,27 +1124,27 @@
       ! IDENTIFY THE ATOMS IN THE OCCUPIED LMO.  ATOMS NOT USED ARE
       ! FLAGGED BY '-1' IN IUSED.
       !
-      mlf = 0
-      do lf = nncf(j) + 1, nncf(j) + ncf(j)
-        ii = icocc(lf)
-        iused_t(ii) = mlf
-        mlf = mlf + iorbs(ii)
-      end do
+	      mlf = 0
+	      do lf = nncf(j) + 1, nncf(j) + ncf(j)
+	        ii = icocc(lf)
+	        iused_t(ii) = mlf
+	        mlf = mlf + iorbs(ii)
+	      end do
       loopi = ncvir(i)
       loopj = ncocc(j)
       mle = 0
       !
       !      ROTATION OF PSEUDO-EIGENVECTORS
       !
-      do le = nnce(i) + 1, nnce(i) + nce(i)
-        mie = icvir(le)
-        latoms_t(mie) = .true.
-        mlff = iused_t(mie) + loopj
-        if (iused_t(mie) >= 0) then
-          !
-          !  TWO BY TWO ROTATION OF ATOMS WHICH ARE COMMON
-          !  TO OCCUPIED LMO J AND VIRTUAL LMO I
-          !
+	      do le = nnce(i) + 1, nnce(i) + nce(i)
+	        mie = icvir(le)
+	        latoms_t(mie) = .true.
+	        mlff = iused_t(mie) + loopj
+	        if (iused_t(mie) >= 0) then
+	          !
+	          !  TWO BY TWO ROTATION OF ATOMS WHICH ARE COMMON
+	          !  TO OCCUPIED LMO J AND VIRTUAL LMO I
+	          !
           do mlee = mle + 1 + loopi, mle + iorbs(mie) + loopi
             mlff = mlff + 1
             a = cocc(mlff)
@@ -1034,21 +1161,21 @@
           do mlee = mle + 1 + loopi, mle + iorbs(mie) + loopi
             sum = sum + (beta*cvir(mlee)) ** 2
           end do
-          if (sum > thresh) then
-            if (nncf(j)+ncf(j) >= jncf) exit
-            if (mlf+iorbs(mie)+loopj > jur) exit
-            !
-            !  YES, OCCUPIED LMO ATOM 'MIE' SHOULD EXIST
-            !
-            ncf(j) = ncf(j) + 1
-            icocc(nncf(j)+ncf(j)) = mie
-            !
-            iused_t(mie) = mlf
-            mlf = mlf + iorbs(mie)
-            !
-            !   PUT INTENSITY INTO OCCUPIED LMO ATOM 'MIE'
-            !
-            mlff = iused_t(mie) + loopj
+	          if (sum > thresh) then
+	            if (nncf(j)+ncf(j) >= jncf) exit
+	            if (mlf+iorbs(mie)+loopj > jur) exit
+	            !
+	            !  YES, OCCUPIED LMO ATOM 'MIE' SHOULD EXIST
+	            !
+		            ncf(j) = ncf(j) + 1
+		            icocc(nncf(j)+ncf(j)) = mie
+		            !
+		            iused_t(mie) = mlf
+		            mlf = mlf + iorbs(mie)
+	            !
+	            !   PUT INTENSITY INTO OCCUPIED LMO ATOM 'MIE'
+	            !
+		            mlff = iused_t(mie) + loopj
             do mlee = mle + 1 + loopi, mle + iorbs(mie) + loopi
               mlff = mlff + 1
               cocc(mlff) = beta * cvir(mlee)
@@ -1059,10 +1186,10 @@
         mle = mle + iorbs(mie)
       end do
 
-      if (le <= nnce(i) + nce(i)) then
-        ! Rejected due to array bounds in occupied expansion.
-        nrej_acc = nrej_acc + 1
-        ! Contiguous restore (same values as pre-rotation state).
+	      if (le <= nnce(i) + nce(i)) then
+	        ! Rejected due to array bounds in occupied expansion.
+	        nrej_acc = nrej_acc + 1
+	        ! Contiguous restore (same values as pre-rotation state).
 	        cocc(jlr:jlr+njlen-1) = storej_t(1:njlen)
 	        cvir(ilr:ilr+nilen-1) = storei_t(1:nilen)
 	        do le = nnce(i) + 1, nnce(i) + nce(i)
@@ -1073,38 +1200,38 @@
 	        end do
 	        ncf(j) = ncfj
 	        nce(i) = ncei
-        if (retry) then
-          alpha = 0.5d0 * (alpha+1.d0)
-          cycle
-        end if
-        return
-      end if
+	        if (retry) then
+	          alpha = 0.5d0 * (alpha+1.d0)
+	          cycle
+	        end if
+	        return
+	      end if
 
       !
       !  NOW CHECK ALL ATOMS WHICH WERE IN THE OCCUPIED LMO
       !  WHICH ARE NOT IN THE VIRTUAL LMO, TO SEE IF THEY
       !  SHOULD BE IN THE VIRTUAL LMO.
       !
-      do lf = nncf(j) + 1, nncf(j) + ncf(j)
-        ii = icocc(lf)
-        if ( .not. latoms_t(ii)) then
-          sum = 0.d0
-          do mlff = iused_t(ii) + loopj + 1, iused_t(ii) + loopj + iorbs(ii)
-            sum = sum + (beta*cocc(mlff)) ** 2
-          end do
-          if (sum > thresh) then
+	      do lf = nncf(j) + 1, nncf(j) + ncf(j)
+	        ii = icocc(lf)
+	        if ( .not. latoms_t(ii)) then
+	          sum = 0.d0
+	          do mlff = iused_t(ii) + loopj + 1, iused_t(ii) + loopj + iorbs(ii)
+	            sum = sum + (beta*cocc(mlff)) ** 2
+	          end do
+	          if (sum > thresh) then
             if (nnce(i)+nce(i) >= incv) exit
             if (mle+iorbs(ii)+loopi > iur) exit
             !
             !  YES, VIRTUAL  LMO ATOM 'II' SHOULD EXIST
-            !
-            nce(i) = nce(i) + 1
-            icvir(nnce(i)+nce(i)) = ii
-            latoms_t(ii) = .true.
-            !
-            !   PUT INTENSITY INTO VIRTUAL  LMO ATOM 'II'
-            !
-            mlff = iused_t(ii) + loopj
+	            !
+	            nce(i) = nce(i) + 1
+	            icvir(nnce(i)+nce(i)) = ii
+	            latoms_t(ii) = .true.
+	            !
+	            !   PUT INTENSITY INTO VIRTUAL  LMO ATOM 'II'
+	            !
+	            mlff = iused_t(ii) + loopj
             do mlee = mle + 1 + loopi, mle + iorbs(ii) + loopi
               mlff = mlff + 1
               cvir(mlee) = -beta * cocc(mlff)
@@ -1115,10 +1242,10 @@
         end if
       end do
 
-      if (lf <= nncf(j) + ncf(j)) then
-        ! Rejected due to array bounds in virtual expansion.
-        nrej_acc = nrej_acc + 1
-        ! Contiguous restore (same values as pre-rotation state).
+	      if (lf <= nncf(j) + ncf(j)) then
+	        ! Rejected due to array bounds in virtual expansion.
+	        nrej_acc = nrej_acc + 1
+	        ! Contiguous restore (same values as pre-rotation state).
 	        cocc(jlr:jlr+njlen-1) = storej_t(1:njlen)
 	        cvir(ilr:ilr+nilen-1) = storei_t(1:nilen)
 	        do le = nnce(i) + 1, nnce(i) + nce(i)
@@ -1129,24 +1256,24 @@
 	        end do
 	        ncf(j) = ncfj
 	        nce(i) = ncei
-        if (retry) then
-          alpha = 0.5d0 * (alpha+1.d0)
-          cycle
-        end if
-        return
-      end if
+	        if (retry) then
+	          alpha = 0.5d0 * (alpha+1.d0)
+	          cycle
+	        end if
+	        return
+	      end if
 
       exit
     end do
 
-    ! Reset counters which have been set.
-    do le = nnce(i) + 1, nnce(i) + nce(i)
-      mie = icvir(le)
-      latoms_t(mie) = .false.
-    end do
-    do lf = nncf(j) + 1, nncf(j) + ncf(j)
-      iused_t(icocc(lf)) = -1
-    end do
+	    ! Reset counters which have been set.
+	    do le = nnce(i) + 1, nnce(i) + nce(i)
+	      mie = icvir(le)
+	      latoms_t(mie) = .false.
+	    end do
+	    do lf = nncf(j) + 1, nncf(j) + ncf(j)
+	      iused_t(icocc(lf)) = -1
+	    end do
 
-  end subroutine process_pair
+	  end subroutine process_pair
   end subroutine diagg2
